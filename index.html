@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Arcade Chase: Orthographic Drift</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #2d2d2d; }
+        canvas { display: block; }
+        .ui { position: absolute; top: 20px; left: 20px; color: white; font-family: monospace; pointer-events: none; user-select: none; }
+    </style>
+</head>
+<body>
+    <div class="ui">
+        <h1 class="text-2xl font-bold text-yellow-400">DRIFT PROTOCOL</h1>
+        <p class="text-sm text-gray-400">WASD / ARROWS to Drive</p>
+        <p class="text-sm text-gray-400">SPACE to Brake</p>
+    </div>
+    <canvas id="gameCanvas"></canvas>
+
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d', { alpha: false }); // Optimize for no transparency on base
+        
+        // --- Configuration ---
+        const CONFIG = {
+            lightDir: { x: 1, y: 1 }, // Light coming from top-left (so shadow goes bottom-right)
+            shadowColor: 'rgba(0, 0, 0, 0.4)',
+            carColor: '#ef4444', // Red-500
+            wheelColor: '#171717', // Neutral-900
+            groundColor: '#333333',
+            gridColor: '#404040',
+            skidMarkColor: 'rgba(20, 20, 20, 0.3)',
+            smokeColor: 'rgba(200, 200, 200, 0.5)',
+        };
+
+        // Normalize light direction
+        const len = Math.sqrt(CONFIG.lightDir.x**2 + CONFIG.lightDir.y**2);
+        CONFIG.lightDir.x /= len;
+        CONFIG.lightDir.y /= len;
+
+        // --- Game State ---
+        let width, height;
+        
+        const camera = { x: 0, y: 0 };
+        
+        const car = {
+            x: 0, 
+            y: 0,
+            width: 24,
+            length: 44,
+            angle: 0,          // Facing direction
+            velocity: { x: 0, y: 0 },
+            speed: 0,
+            steerAngle: 0,     // Current wheel angle relative to car
+            maxSteer: 0.6,     // ~35 degrees
+            acceleration: 0.4,
+            friction: 0.98,
+            driftFactor: 0.92, // How much velocity aligns with facing (1.0 = no drift, 0.0 = ice)
+            turnSpeed: 0.08,
+            wheelBase: 28,
+            trackWidth: 26,
+            wheelWidth: 6,
+            wheelLength: 12
+        };
+
+        const inputs = {
+            up: false,
+            down: false,
+            left: false,
+            right: false,
+            brake: false
+        };
+
+        const particles = [];
+        const skidMarks = []; // Persistent skid marks on the ground
+        
+        // Speed lines/dust particles for motion reference
+        const dustParticles = Array.from({ length: 50 }, () => ({
+            x: Math.random() * window.innerWidth,
+            y: Math.random() * window.innerHeight,
+            size: Math.random() * 2 + 1
+        }));
+
+        // --- Resize Handling ---
+        function resize() {
+            width = window.innerWidth;
+            height = window.innerHeight;
+            canvas.width = width;
+            canvas.height = height;
+        }
+        window.addEventListener('resize', resize);
+        resize();
+
+        // --- Input Handling ---
+        window.addEventListener('keydown', (e) => {
+            if (e.key === 'ArrowUp' || e.key === 'w') inputs.up = true;
+            if (e.key === 'ArrowDown' || e.key === 's') inputs.down = true;
+            if (e.key === 'ArrowLeft' || e.key === 'a') inputs.left = true;
+            if (e.key === 'ArrowRight' || e.key === 'd') inputs.right = true;
+            if (e.key === ' ') inputs.brake = true;
+        });
+
+        window.addEventListener('keyup', (e) => {
+            if (e.key === 'ArrowUp' || e.key === 'w') inputs.up = false;
+            if (e.key === 'ArrowDown' || e.key === 's') inputs.down = false;
+            if (e.key === 'ArrowLeft' || e.key === 'a') inputs.left = false;
+            if (e.key === 'ArrowRight' || e.key === 'd') inputs.right = false;
+            if (e.key === ' ') inputs.brake = false;
+        });
+
+        // --- Math Helpers ---
+        function lerp(a, b, t) { return a + (b - a) * t; }
+        function clamp(val, min, max) { return Math.max(min, Math.min(max, val)); }
+
+        // --- Physics Engine ---
+        function updatePhysics() {
+            // Steering input
+            const targetSteer = (inputs.right ? 1 : 0) - (inputs.left ? 1 : 0);
+            
+            // Steer logic: responsive but smooth
+            // Higher speed = slower steering response (stability)
+            const steerSpeed = 0.2 - (Math.min(car.speed, 20) * 0.005);
+            car.steerAngle = lerp(car.steerAngle, targetSteer * car.maxSteer, Math.max(0.05, steerSpeed));
+
+            // Acceleration
+            let throttle = 0;
+            if (inputs.up) throttle = 1;
+            if (inputs.down) throttle = -0.5;
+            
+            // Handbrake overrides throttle
+            if (inputs.brake) throttle = 0;
+
+            // Apply force in facing direction
+            const forwardX = Math.cos(car.angle);
+            const forwardY = Math.sin(car.angle);
+
+            // Engine power
+            car.velocity.x += forwardX * throttle * car.acceleration;
+            car.velocity.y += forwardY * throttle * car.acceleration;
+
+            // Global Friction
+            car.velocity.x *= car.friction;
+            car.velocity.y *= car.friction;
+            
+            // Handbrake friction (stronger deceleration)
+            if (inputs.brake) {
+                car.velocity.x *= 0.96;
+                car.velocity.y *= 0.96;
+            }
+
+            // Calculate speed
+            car.speed = Math.sqrt(car.velocity.x**2 + car.velocity.y**2);
+
+            // Turning Physics
+            if (car.speed > 0.1) {
+                const dot = car.velocity.x * forwardX + car.velocity.y * forwardY;
+                const dir = dot > 0 ? 1 : -1; // Moving forward or backward
+                
+                // Turn rate depends on speed. 
+                // Low speed: Turn fast (parking). High speed: Turn slower (highway).
+                // But drift requires oversteer.
+                // We multiply steering by speed to get angular change, but clamp it.
+                car.angle += car.steerAngle * Math.min(car.speed, 8) * 0.012 * dir; 
+            }
+
+            // --- DRIFT & GRIP ---
+            if (car.speed > 0.1) {
+                const vx = car.velocity.x;
+                const vy = car.velocity.y;
+
+                const rightX = -Math.sin(car.angle);
+                const rightY = Math.cos(car.angle);
+                
+                // Lateral velocity (how much we are sliding sideways)
+                const lateralVel = vx * rightX + vy * rightY;
+                const lateralSpeed = Math.abs(lateralVel);
+
+                // Grip Factor:
+                // Normal driving: high grip (kill lateral velocity)
+                // Drifting (Handbrake or excessive lateral force): low grip
+                
+                let lateralFriction = 0.85; // Base grip
+                
+                // Initiate drift if turning hard at speed or handbraking
+                if (inputs.brake) {
+                    lateralFriction = 0.96; // Ice-like slide
+                } else if (lateralSpeed > 2.0) {
+                    lateralFriction = 0.92; // Momentum carries slide
+                }
+
+                // Apply lateral friction (cancel out sideways movement)
+                const newLateralVel = lateralVel * lateralFriction;
+                
+                // Longitudinal velocity
+                const fwdDot = vx * forwardX + vy * forwardY;
+                
+                // Recompose velocity
+                car.velocity.x = forwardX * fwdDot + rightX * newLateralVel;
+                car.velocity.y = forwardY * fwdDot + rightY * newLateralVel;
+
+                // Visual Effects
+                if (lateralSpeed > 1.5 || (inputs.brake && car.speed > 1)) {
+                    addWheelEffects(lateralSpeed);
+                }
+            }
+
+            // Update Position
+            car.x += car.velocity.x;
+            car.y += car.velocity.y;
+
+            // Camera follow with slight lookahead based on velocity
+            const lookaheadX = car.velocity.x * 20;
+            const lookaheadY = car.velocity.y * 20;
+            camera.x = lerp(camera.x, (car.x + lookaheadX) - width / 2, 0.08);
+            camera.y = lerp(camera.y, (car.y + lookaheadY) - height / 2, 0.08);
+        }
+
+        // --- Particle System ---
+        function createParticle(x, y, type) {
+            particles.push({
+                x, y,
+                vx: (Math.random() - 0.5) * 2 + car.velocity.x * 0.5,
+                vy: (Math.random() - 0.5) * 2 + car.velocity.y * 0.5,
+                life: 1.0,
+                decay: 0.02 + Math.random() * 0.03,
+                size: 2 + Math.random() * 4,
+                type: type // 'smoke' or 'spark'
+            });
+        }
+
+        function createSkid(x, y) {
+            // Only add skid marks periodically to save performance/memory or visual clutter
+            // For now, just a simple point, in a real engine we'd use a ribbon mesh
+            skidMarks.push({ x, y, life: 1.0, angle: car.angle });
+            if (skidMarks.length > 500) skidMarks.shift(); // Limit history
+        }
+
+        function addWheelEffects(intensity) {
+            // Calculate wheel positions in world space
+            const corners = [
+                { x: car.wheelBase/2, y: car.trackWidth/2, f: true }, // Front Right
+                { x: car.wheelBase/2, y: -car.trackWidth/2, f: true }, // Front Left
+                { x: -car.wheelBase/2, y: car.trackWidth/2, f: false }, // Rear Right
+                { x: -car.wheelBase/2, y: -car.trackWidth/2, f: false }  // Rear Left
+            ];
+
+            const cos = Math.cos(car.angle);
+            const sin = Math.sin(car.angle);
+
+            corners.forEach((offset) => {
+                const wx = car.x + (offset.x * cos - offset.y * sin);
+                const wy = car.y + (offset.x * sin + offset.y * cos);
+
+                // Smoke generation - more intense with higher slip
+                if (Math.random() < Math.min(intensity * 0.2, 0.8)) {
+                    createParticle(wx, wy, 'smoke');
+                }
+                
+                // Skid marks - continuous if drifting hard
+                if (intensity > 2.0 || inputs.brake) {
+                    createSkid(wx, wy);
+                }
+                
+                // Sparks? If extremely fast drift
+                if (intensity > 6.0 && Math.random() > 0.9) {
+                    createParticle(wx, wy, 'spark');
+                }
+            });
+        }
+
+        function updateParticles() {
+            for (let i = particles.length - 1; i >= 0; i--) {
+                const p = particles[i];
+                p.x += p.vx;
+                p.y += p.vy;
+                p.vx *= 0.95;
+                p.vy *= 0.95;
+                p.life -= p.decay;
+                p.size *= 1.05; // Expand smoke
+
+                if (p.life <= 0) {
+                    particles.splice(i, 1);
+                }
+            }
+            
+            // Fade skids
+            for (let i = skidMarks.length - 1; i >= 0; i--) {
+                skidMarks[i].life -= 0.005;
+                if (skidMarks[i].life <= 0) skidMarks.splice(i, 1);
+            }
+        }
+
+        // --- Rendering ---
+        
+        function drawGround() {
+            // Draw background color
+            ctx.fillStyle = CONFIG.groundColor;
+            ctx.fillRect(0, 0, width, height);
+
+            // Draw Grid (World Space)
+            ctx.save();
+            ctx.translate(-camera.x, -camera.y);
+            
+            ctx.strokeStyle = CONFIG.gridColor;
+            ctx.lineWidth = 2;
+            const gridSize = 100;
+            
+            // Calculate visible range
+            const startX = Math.floor(camera.x / gridSize) * gridSize;
+            const startY = Math.floor(camera.y / gridSize) * gridSize;
+            const endX = startX + width + gridSize;
+            const endY = startY + height + gridSize;
+
+            ctx.beginPath();
+            for (let x = startX; x <= endX; x += gridSize) {
+                ctx.moveTo(x, startY);
+                ctx.lineTo(x, endY);
+            }
+            for (let y = startY; y <= endY; y += gridSize) {
+                ctx.moveTo(startX, y);
+                ctx.lineTo(endX, y);
+            }
+            ctx.stroke();
+
+            // Draw Skid Marks
+            for (const s of skidMarks) {
+                ctx.fillStyle = `rgba(10, 10, 10, ${s.life * 0.5})`;
+                ctx.save();
+                ctx.translate(s.x, s.y);
+                ctx.rotate(s.angle);
+                ctx.fillRect(-4, -4, 8, 8); 
+                ctx.restore();
+            }
+
+            ctx.restore();
+        }
+
+        function drawDust() {
+            ctx.fillStyle = '#666';
+            
+            // We simulate dust by updating their screen position relative to camera movement
+            // Ideally this should be in update loop, but doing it here for simplicity
+            // To make them "World" fixed, we can just use (worldPos % viewport)
+            
+            // Actually, let's treat them as world objects wrapped in a large window around the camera
+            // to avoid floating point issues? No, simplest is Screen Space Parallax.
+            
+            // Update dust positions based on car velocity (approximation of camera move)
+            const dx = car.velocity.x;
+            const dy = car.velocity.y;
+
+            dustParticles.forEach(p => {
+                p.x -= dx;
+                p.y -= dy;
+
+                // Wrap around screen
+                if (p.x < 0) p.x += width;
+                if (p.x > width) p.x -= width;
+                if (p.y < 0) p.y += height;
+                if (p.y > height) p.y -= height;
+
+                // Draw
+                ctx.fillRect(p.x, p.y, p.size, p.size);
+            });
+            
+            // Speed Lines (at high speed)
+            if (car.speed > 10) {
+                ctx.strokeStyle = 'rgba(255, 255, 255, 0.1)';
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                for (let i = 0; i < 10; i++) {
+                    const lx = Math.random() * width;
+                    const ly = Math.random() * height;
+                    const len = car.speed * 2;
+                    // Draw line opposite to velocity
+                    const angle = Math.atan2(car.velocity.y, car.velocity.x);
+                    ctx.moveTo(lx, ly);
+                    ctx.lineTo(lx - Math.cos(angle) * len, ly - Math.sin(angle) * len);
+                }
+                ctx.stroke();
+            }
+        }
+
+        function drawShadow() {
+            ctx.save();
+            ctx.translate(-camera.x, -camera.y);
+            
+            const bodyHeight = 16;
+            const wheelHeight = 4; // Wheels are lower to ground
+
+            const bx = CONFIG.lightDir.x * bodyHeight;
+            const by = CONFIG.lightDir.y * bodyHeight;
+            const wx = CONFIG.lightDir.x * wheelHeight;
+            const wy = CONFIG.lightDir.y * wheelHeight;
+
+            // Draw shadow relative to car position
+            ctx.translate(car.x, car.y);
+            
+            // We need to draw the rotated shapes at the offset positions
+            ctx.fillStyle = CONFIG.shadowColor;
+            
+            // 1. Wheel Shadows (Low offset)
+            const drawWheelShadow = (x, y, angle) => {
+                ctx.save();
+                // Apply wheel offset relative to car center, then add shadow offset
+                // We rotate the wheel position offset by car angle
+                const cos = Math.cos(car.angle);
+                const sin = Math.sin(car.angle);
+                const rx = x * cos - y * sin;
+                const ry = x * sin + y * cos;
+                
+                ctx.translate(rx + wx, ry + wy); // Move to wheel world pos + shadow offset
+                ctx.rotate(car.angle + angle);   // Rotate by car + steer
+                ctx.fillRect(-car.wheelLength/2, -car.wheelWidth/2, car.wheelLength, car.wheelWidth);
+                ctx.restore();
+            };
+
+            drawWheelShadow(-car.wheelBase/2, car.trackWidth/2, 0);
+            drawWheelShadow(-car.wheelBase/2, -car.trackWidth/2, 0);
+            drawWheelShadow(car.wheelBase/2, car.trackWidth/2, car.steerAngle);
+            drawWheelShadow(car.wheelBase/2, -car.trackWidth/2, car.steerAngle);
+
+            // 2. Body Shadow (Higher offset)
+            ctx.save();
+            ctx.translate(bx, by); // Body shadow offset
+            ctx.rotate(car.angle);
+            ctx.fillRect(-car.length/2, -car.width/2, car.length, car.width);
+            ctx.restore();
+
+            ctx.restore();
+        }
+
+        function drawCar() {
+            ctx.save();
+            ctx.translate(-camera.x, -camera.y);
+            ctx.translate(car.x, car.y);
+            ctx.rotate(car.angle);
+
+            // --- Wheels (Draw first so they are under body if overlapping, though side-mount usually OK) ---
+            ctx.fillStyle = CONFIG.wheelColor;
+            const drawWheel = (x, y, angle) => {
+                ctx.save();
+                ctx.translate(x, y);
+                ctx.rotate(angle);
+                ctx.beginPath();
+                ctx.roundRect(-car.wheelLength/2, -car.wheelWidth/2, car.wheelLength, car.wheelWidth, 2);
+                ctx.fill();
+                // Rim detail
+                if (car.speed < 5) {
+                    ctx.fillStyle = '#444';
+                    ctx.fillRect(-2, -3, 4, 6); // Axle cap
+                    ctx.fillStyle = CONFIG.wheelColor;
+                }
+                ctx.restore();
+            };
+
+            drawWheel(-car.wheelBase/2, car.trackWidth/2, 0);
+            drawWheel(-car.wheelBase/2, -car.trackWidth/2, 0);
+            drawWheel(car.wheelBase/2, car.trackWidth/2, car.steerAngle);
+            drawWheel(car.wheelBase/2, -car.trackWidth/2, car.steerAngle);
+
+            // --- Body ---
+            // Main Chassis
+            ctx.fillStyle = CONFIG.carColor;
+            ctx.beginPath();
+            ctx.roundRect(-car.length/2, -car.width/2, car.length, car.width, 3);
+            ctx.fill();
+
+            // Roof/Cabin (Darker)
+            ctx.fillStyle = '#991b1b'; 
+            ctx.fillRect(-10, -car.width/2 + 2, 20, car.width - 4);
+            
+            // Windshields
+            ctx.fillStyle = '#111';
+            ctx.fillRect(8, -car.width/2 + 3, 2, car.width - 6); // Front
+            ctx.fillRect(-9, -car.width/2 + 3, 2, car.width - 6); // Rear
+
+            // Brake Lights (Active when braking)
+            if (inputs.brake) {
+                ctx.fillStyle = '#ff0000';
+                ctx.shadowColor = '#ff0000';
+                ctx.shadowBlur = 10;
+            } else {
+                ctx.fillStyle = '#500000';
+                ctx.shadowBlur = 0;
+            }
+            ctx.fillRect(-car.length/2, -car.width/2 + 1, 2, 6);
+            ctx.fillRect(-car.length/2, car.width/2 - 7, 2, 6);
+            ctx.shadowBlur = 0; // Reset
+
+            // Headlights (Simple yellow squares)
+            ctx.fillStyle = '#facc15';
+            ctx.fillRect(car.length/2 - 1, -car.width/2 + 1, 1, 5);
+            ctx.fillRect(car.length/2 - 1, car.width/2 - 6, 1, 5);
+
+            ctx.restore();
+        }
+
+        function drawParticles() {
+            ctx.save();
+            ctx.translate(-camera.x, -camera.y);
+
+            for (const p of particles) {
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+                ctx.fillStyle = p.type === 'smoke' 
+                    ? `rgba(200, 200, 200, ${p.life * 0.4})`
+                    : `rgba(255, 200, 50, ${p.life})`;
+                ctx.fill();
+            }
+
+            ctx.restore();
+        }
+
+        function loop() {
+            updatePhysics();
+            updateParticles();
+
+            // Clear
+            ctx.clearRect(0, 0, width, height);
+
+            // Draw Order
+            drawGround();
+            drawDust();
+            drawShadow();
+            drawParticles();
+            drawCar();
+
+            requestAnimationFrame(loop);
+        }
+
+        // Start
+        loop();
+
+    </script>
+</body>
+</html>

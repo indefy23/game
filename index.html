@@ -109,6 +109,121 @@
             return result ? { r: parseInt(result[1], 16), g: parseInt(result[2], 16), b: parseInt(result[3], 16) } : null;
         }
 
+        // --- Environment Items Generation (Trees, Walls, Bushes) ---
+        function getEnvironmentItems(gx, gy) {
+            const items = [];
+            const gridSize = CITY_CONFIG.blockSize;
+            const roadW = CITY_CONFIG.roadWidth;
+            const block = getCityBlock(gx, gy);
+
+            // Hash para variação determinística
+            const hash = (seed) => Math.abs(Math.sin(gx * 127.1 + gy * 311.7 + seed * 758.5) * 43758.5453) % 1;
+
+            const bx = gx * gridSize;
+            const by = gy * gridSize;
+
+            // Posições nas calçadas (margens da estrada)
+            const sidewalkPositions = [
+                // Canto superior esquerdo
+                { x: bx + roadW * 0.25, y: by + roadW * 0.25 },
+                // Canto superior direito
+                { x: bx + gridSize - roadW * 0.25, y: by + roadW * 0.25 },
+                // Canto inferior esquerdo
+                { x: bx + roadW * 0.25, y: by + gridSize - roadW * 0.25 },
+                // Canto inferior direito
+                { x: bx + gridSize - roadW * 0.25, y: by + gridSize - roadW * 0.25 },
+                // Meio das calçadas
+                { x: bx + gridSize / 2, y: by + roadW * 0.3 },
+                { x: bx + roadW * 0.3, y: by + gridSize / 2 },
+            ];
+
+            // Árvores - nas calçadas
+            for (let i = 0; i < sidewalkPositions.length; i++) {
+                const h = hash(i * 10 + 1);
+                if (h > 0.55) continue; // 45% chance de árvore
+
+                const pos = sidewalkPositions[i];
+                const treeHeight = 40 + hash(i * 10 + 2) * 25;
+                const crownSize = 18 + hash(i * 10 + 3) * 12;
+
+                items.push({
+                    type: 'tree',
+                    x: pos.x,
+                    y: pos.y,
+                    height: treeHeight,
+                    crownSize: crownSize,
+                    trunkWidth: 6 + hash(i * 10 + 4) * 4,
+                    color: hash(i * 10 + 5) > 0.5 ? '#166534' : '#15803d', // Green-800/700
+                    trunkColor: '#78350f' // Amber-900
+                });
+            }
+
+            // Muros - bordas das propriedades (se houver prédio)
+            if (block) {
+                const wallH = hash(100);
+                if (wallH < 0.4) { // 40% chance de muro
+                    const wallHeight = 15 + hash(101) * 12;
+                    const wallColor = hash(102) > 0.5 ? '#78716c' : '#a8a29e'; // Stone-500/400
+
+                    // Muro na borda superior do prédio
+                    if (hash(103) > 0.5) {
+                        items.push({
+                            type: 'wall',
+                            x: bx + roadW / 2,
+                            y: by + roadW / 2 - 8,
+                            width: gridSize - roadW,
+                            depth: 8,
+                            height: wallHeight,
+                            color: wallColor
+                        });
+                    }
+
+                    // Muro na borda esquerda do prédio
+                    if (hash(104) > 0.5) {
+                        items.push({
+                            type: 'wall',
+                            x: bx + roadW / 2 - 8,
+                            y: by + roadW / 2,
+                            width: 8,
+                            depth: gridSize - roadW,
+                            height: wallHeight,
+                            color: wallColor
+                        });
+                    }
+                }
+            }
+
+            // Arbustos - junto aos muros e calçadas
+            for (let i = 0; i < 4; i++) {
+                const h = hash(200 + i);
+                if (h > 0.35) continue; // 35% chance
+
+                const bushX = bx + roadW * 0.4 + hash(210 + i) * (gridSize - roadW * 0.8);
+                const bushY = by + roadW * 0.4 + hash(220 + i) * (gridSize - roadW * 0.8);
+
+                // Evitar centro do bloco (onde está o prédio)
+                const localX = bushX - bx;
+                const localY = bushY - by;
+                const margin = roadW / 2;
+                const size = gridSize - roadW;
+                if (localX > margin && localX < margin + size && localY > margin && localY < margin + size) {
+                    continue;
+                }
+
+                items.push({
+                    type: 'bush',
+                    x: bushX,
+                    y: bushY,
+                    width: 15 + hash(230 + i) * 12,
+                    depth: 12 + hash(240 + i) * 8,
+                    height: 8 + hash(250 + i) * 8,
+                    color: hash(260 + i) > 0.5 ? '#166534' : '#14532d' // Green-800/900
+                });
+            }
+
+            return items;
+        }
+
         // --- Game State ---
         let width, height;
 
@@ -193,25 +308,46 @@
             const gridSize = CITY_CONFIG.blockSize;
             const roadW = CITY_CONFIG.roadWidth;
             const size = gridSize - roadW;
-            const margin = roadW / 2; // Os prédios são centralizados: cx = bx + roadW/2
+            const margin = roadW / 2;
 
-            // Determinar em qual bloco o ponto está (correto para números negativos)
             const gx = Math.floor(x / gridSize);
             const gy = Math.floor(y / gridSize);
 
+            // Colisão com prédio
             const block = getCityBlock(gx, gy);
-            if (!block) return false;
+            if (block) {
+                const lx = x - (gx * gridSize);
+                const ly = y - (gy * gridSize);
+                if (lx > margin && lx < margin + size && ly > margin && ly < margin + size) {
+                    return true;
+                }
+            }
 
-            // Coordenadas locais dentro do bloco [0, gridSize]
-            const lx = x - (gx * gridSize);
-            const ly = y - (gy * gridSize);
+            // Colisão com elementos do ambiente (bloco atual e vizinhos)
+            for (let dx = -1; dx <= 1; dx++) {
+                for (let dy = -1; dy <= 1; dy++) {
+                    const items = getEnvironmentItems(gx + dx, gy + dy);
+                    for (const item of items) {
+                        if (item.type === 'tree') {
+                            // Colisão circular com tronco - um pouco mais generosa para evitar atravessar
+                            const dist = Math.sqrt((x - item.x) ** 2 + (y - item.y) ** 2);
+                            if (dist < item.trunkWidth * 0.8) return true;
+                        } else if (item.type === 'wall') {
+                            // Colisão retangular
+                            if (x > item.x && x < item.x + item.width &&
+                                y > item.y && y < item.y + item.depth) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
 
-            // O prédio está exatamente em [margin, margin + size]
-            return lx > margin && lx < margin + size &&
-                ly > margin && ly < margin + size;
+            return false;
         }
 
         function updatePhysics() {
+            // ... (restante sem alteração até os corners)
             // 1. Input & Basic Handling
             const targetSteer = (inputs.right ? 1 : 0) - (inputs.left ? 1 : 0);
 
@@ -333,7 +469,8 @@
                 { nx: nextX + (hl * cos - hw * sin), ny: nextY + (hl * sin + hw * cos) },
                 { nx: nextX + (hl * cos + hw * sin), ny: nextY + (hl * sin - hw * cos) },
                 { nx: nextX + (-hl * cos - hw * sin), ny: nextY + (-hl * sin + hw * cos) },
-                { nx: nextX + (-hl * cos + hw * sin), ny: nextY + (-hl * sin - hw * cos) }
+                { nx: nextX + (-hl * cos + hw * sin), ny: nextY + (-hl * sin - hw * cos) },
+                { nx: nextX, ny: nextY } // Ponto central para evitar passar por troncos finos
             ];
 
             let hasCollided = false;
@@ -507,6 +644,30 @@
                             roofColor: block.roofColor
                         });
                     }
+
+                    // Add Environment Items (Trees, Walls, Bushes)
+                    const envItems = getEnvironmentItems(c, r);
+                    for (const item of envItems) {
+                        if (item.type === 'tree') {
+                            renderList.push({
+                                type: 'tree',
+                                y: item.y + item.crownSize / 2,
+                                ...item
+                            });
+                        } else if (item.type === 'wall') {
+                            renderList.push({
+                                type: 'wall',
+                                y: item.y + item.depth,
+                                ...item
+                            });
+                        } else if (item.type === 'bush') {
+                            renderList.push({
+                                type: 'bush',
+                                y: item.y + item.depth / 2,
+                                ...item
+                            });
+                        }
+                    }
                 }
             }
 
@@ -532,7 +693,7 @@
             // Car Shadow
             drawShadow();
 
-            // Building Shadows
+            // Building and Environment Shadows
             ctx.fillStyle = CONFIG.shadowColor;
             ctx.save();
             ctx.translate(-camera.x, -camera.y);
@@ -555,6 +716,35 @@
                     const shadX = item.x + sx;
                     const shadY = item.baseY + sy;
                     ctx.fillRect(shadX, shadY, item.w, item.h);
+                } else if (item.type === 'tree') {
+                    // Sombra combinada (Tronco + Copa)
+                    const sx = item.height * CONFIG.lightDir.x * 0.6;
+                    const sy = item.height * CONFIG.lightDir.y * 0.6;
+
+                    // 1. Unificar sombra do tronco e da copa em um único path para evitar sobreposição de alpha
+                    const tw = item.trunkWidth / 2;
+                    ctx.beginPath();
+                    // Tronco
+                    ctx.moveTo(item.x - tw, item.y);
+                    ctx.lineTo(item.x + tw, item.y);
+                    ctx.lineTo(item.x + tw + sx, item.y + sy);
+                    ctx.lineTo(item.x - tw + sx, item.y + sy);
+                    ctx.closePath();
+                    // Copa
+                    ctx.ellipse(item.x + sx, item.y + sy, item.crownSize, item.crownSize * 0.7, 0, 0, Math.PI * 2);
+                    ctx.fill();
+                } else if (item.type === 'wall') {
+                    // Sombra retangular
+                    const sx = item.height * CONFIG.lightDir.x;
+                    const sy = item.height * CONFIG.lightDir.y;
+                    ctx.fillRect(item.x + sx, item.y + sy, item.width, item.depth);
+                } else if (item.type === 'bush') {
+                    // Sombra elíptica pequena
+                    const sx = item.height * CONFIG.lightDir.x * 0.5;
+                    const sy = item.height * CONFIG.lightDir.y * 0.5;
+                    ctx.beginPath();
+                    ctx.ellipse(item.x + sx, item.y + sy, item.width / 2, item.depth / 2, 0, 0, Math.PI * 2);
+                    ctx.fill();
                 }
             });
             ctx.restore();
@@ -581,18 +771,16 @@
             // 7. Draw Sorted Objects
             renderList.forEach(item => {
                 if (item.type === 'car') {
-                    // Car manages its own camera transform? No, drawCar does "ctx.translate(-camera.x...)"
-                    drawParticles(); // Draw particles behind car (as originally) ??? 
-                    // Original order: Ground, Dust, Shadow, Particles, Car.
-                    // New order: Ground, Shadows, Skids, Sorted(Buildings, Car).
-                    // Particles are tricky. Smoke should be sorted too ideally.
-                    // For now, let's call drawParticles() HERE if it's the car turn?
-                    // Or just call drawParticles() before the loop? 
-                    // If particles are strictly :smoke from tires", they are low. 
-                    // Let's draw them BEFORE the sorted loop to be safe (behind buildings).
+                    drawParticles();
                     drawCar();
-                } else {
+                } else if (item.type === 'building') {
                     drawBuilding(item);
+                } else if (item.type === 'tree') {
+                    drawTree(item);
+                } else if (item.type === 'wall') {
+                    drawWall(item);
+                } else if (item.type === 'bush') {
+                    drawBush(item);
                 }
             });
         }
@@ -704,6 +892,164 @@
             if (!rgb) return hex;
             const f = (val) => Math.max(0, Math.min(255, val + percent));
             return `rgb(${f(rgb.r)},${f(rgb.g)},${f(rgb.b)})`;
+        }
+
+        // --- Draw Tree (Copa esférica + Tronco) ---
+        function drawTree(t) {
+            ctx.save();
+            ctx.translate(-camera.x, -camera.y);
+
+            // Pseudo-3D extrusion based on camera
+            const cameraCX = camera.x + width / 2;
+            const cameraCY = camera.y + height / 2;
+            const dx = t.x - cameraCX;
+            const dy = t.y - cameraCY;
+
+            const fovScale = 0.25;
+            const extrusionX = (dx * fovScale) * (t.height / 300);
+            const extrusionY = (dy * fovScale) * (t.height / 300);
+
+            // --- Tronco 3D Extrudado ---
+            const tw = t.trunkWidth / 2;
+            const baseCorners = [
+                { x: t.x - tw, y: t.y - tw },
+                { x: t.x + tw, y: t.y - tw },
+                { x: t.x + tw, y: t.y + tw },
+                { x: t.x - tw, y: t.y + tw }
+            ];
+
+            const topX = t.x + extrusionX;
+            const topY = t.y + extrusionY;
+            const topCorners = [
+                { x: topX - tw, y: topY - tw },
+                { x: topX + tw, y: topY - tw },
+                { x: topX + tw, y: topY + tw },
+                { x: topX - tw, y: topY + tw }
+            ];
+
+            // Desenhar faces do tronco para volume
+            for (let i = 0; i < 4; i++) {
+                const next = (i + 1) % 4;
+                ctx.fillStyle = i % 2 === 0 ? t.trunkColor : shadeColor(t.trunkColor, -15);
+                ctx.beginPath();
+                ctx.moveTo(baseCorners[i].x, baseCorners[i].y);
+                ctx.lineTo(baseCorners[next].x, baseCorners[next].y);
+                ctx.lineTo(topCorners[next].x, topCorners[next].y);
+                ctx.lineTo(topCorners[i].x, topCorners[i].y);
+                ctx.closePath();
+                ctx.fill();
+            }
+
+            // Copa (topo com extrusion)
+            const crownX = topX;
+            const crownY = topY;
+
+            // Copa principal
+            ctx.fillStyle = t.color;
+            ctx.beginPath();
+            ctx.ellipse(crownX, crownY, t.crownSize, t.crownSize * 0.85, 0, 0, Math.PI * 2);
+            ctx.fill();
+
+            // Destaque claro na copa
+            ctx.fillStyle = shadeColor(t.color, 15);
+            ctx.beginPath();
+            ctx.ellipse(crownX - t.crownSize * 0.2, crownY - t.crownSize * 0.2, t.crownSize * 0.5, t.crownSize * 0.4, 0, 0, Math.PI * 2);
+            ctx.fill();
+
+            ctx.restore();
+        }
+
+        // --- Draw Wall (Paralelepípedo baixo) ---
+        function drawWall(w) {
+            ctx.save();
+            ctx.translate(-camera.x, -camera.y);
+
+            // Pseudo-3D extrusion
+            const cameraCX = camera.x + width / 2;
+            const cameraCY = camera.y + height / 2;
+            const boxCX = w.x + w.width / 2;
+            const boxCY = w.y + w.depth / 2;
+            const dx = boxCX - cameraCX;
+            const dy = boxCY - cameraCY;
+
+            const fovScale = 0.3;
+            const extrusionX = (dx * fovScale) * (w.height / 200);
+            const extrusionY = (dy * fovScale) * (w.height / 200);
+
+            const topX = w.x + extrusionX;
+            const topY = w.y + extrusionY;
+
+            // Paredes laterais
+            const baseCorners = [
+                { x: w.x, y: w.y },
+                { x: w.x + w.width, y: w.y },
+                { x: w.x + w.width, y: w.y + w.depth },
+                { x: w.x, y: w.y + w.depth }
+            ];
+
+            const topCorners = [
+                { x: topX, y: topY },
+                { x: topX + w.width, y: topY },
+                { x: topX + w.width, y: topY + w.depth },
+                { x: topX, y: topY + w.depth }
+            ];
+
+            for (let i = 0; i < 4; i++) {
+                const next = (i + 1) % 4;
+                ctx.fillStyle = i % 2 === 0 ? w.color : shadeColor(w.color, -10);
+                ctx.beginPath();
+                ctx.moveTo(baseCorners[i].x, baseCorners[i].y);
+                ctx.lineTo(baseCorners[next].x, baseCorners[next].y);
+                ctx.lineTo(topCorners[next].x, topCorners[next].y);
+                ctx.lineTo(topCorners[i].x, topCorners[i].y);
+                ctx.closePath();
+                ctx.fill();
+            }
+
+            // Topo
+            ctx.fillStyle = shadeColor(w.color, 10);
+            ctx.fillRect(topX, topY, w.width, w.depth);
+
+            ctx.restore();
+        }
+
+        // --- Draw Bush (Elipsoide baixo) ---
+        function drawBush(b) {
+            ctx.save();
+            ctx.translate(-camera.x, -camera.y);
+
+            // Pseudo-3D extrusion
+            const cameraCX = camera.x + width / 2;
+            const cameraCY = camera.y + height / 2;
+            const dx = b.x - cameraCX;
+            const dy = b.y - cameraCY;
+
+            const fovScale = 0.2;
+            const extrusionX = (dx * fovScale) * (b.height / 150);
+            const extrusionY = (dy * fovScale) * (b.height / 150);
+
+            const topX = b.x + extrusionX;
+            const topY = b.y + extrusionY;
+
+            // Base
+            ctx.fillStyle = shadeColor(b.color, -15);
+            ctx.beginPath();
+            ctx.ellipse(b.x, b.y, b.width / 2, b.depth / 2, 0, 0, Math.PI * 2);
+            ctx.fill();
+
+            // Topo com extrusion
+            ctx.fillStyle = b.color;
+            ctx.beginPath();
+            ctx.ellipse(topX, topY, b.width / 2 * 0.9, b.depth / 2 * 0.9, 0, 0, Math.PI * 2);
+            ctx.fill();
+
+            // Destaque
+            ctx.fillStyle = shadeColor(b.color, 12);
+            ctx.beginPath();
+            ctx.ellipse(topX - b.width * 0.1, topY - b.depth * 0.1, b.width / 4, b.depth / 4, 0, 0, Math.PI * 2);
+            ctx.fill();
+
+            ctx.restore();
         }
 
         function drawDust() {

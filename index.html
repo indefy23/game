@@ -348,10 +348,27 @@
                 car.x = nextX;
                 car.y = nextY;
             } else {
-                // Resposta de colisão: parar o carro e anular velocidade
-                car.velocity.x = 0;
-                car.velocity.y = 0;
-                car.speed = 0;
+                // Resposta de colisão aprimorada: 
+                // 1. Tenta mover apenas em X ou Y para permitir deslizar nas paredes
+                const canMoveX = !corners.some(p => checkCollision(nextX + (p.nx - nextX), car.y + (p.ny - nextY)));
+                const canMoveY = !corners.some(p => checkCollision(car.x + (p.nx - nextX), nextY + (p.ny - nextY)));
+
+                if (canMoveX) {
+                    car.x = nextX;
+                    car.velocity.y *= 0.5; // Reduz velocidade lateral
+                } else if (canMoveY) {
+                    car.y = nextY;
+                    car.velocity.x *= 0.5; // Reduz velocidade lateral
+                } else {
+                    // Se estiver totalmente bloqueado, repele levemente e zera
+                    const pushDirX = car.x < nextX ? -1 : 1;
+                    const pushDirY = car.y < nextY ? -1 : 1;
+                    car.x += pushDirX * 1;
+                    car.y += pushDirY * 1;
+                    car.velocity.x *= -0.2; // Pequeno rebote
+                    car.velocity.y *= -0.2;
+                }
+                car.speed = Math.sqrt(car.velocity.x ** 2 + car.velocity.y ** 2);
             }
 
             // 10. Camera Dynamics (Mass-Spring-Damper)

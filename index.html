@@ -189,6 +189,28 @@
         function clamp(val, min, max) { return Math.max(min, Math.min(max, val)); }
 
         // --- Physics Engine ---
+        function checkCollision(x, y) {
+            const gridSize = CITY_CONFIG.blockSize;
+            const roadW = CITY_CONFIG.roadWidth;
+            const size = gridSize - roadW;
+            const margin = roadW / 2; // Os prédios são centralizados: cx = bx + roadW/2
+
+            // Determinar em qual bloco o ponto está (correto para números negativos)
+            const gx = Math.floor(x / gridSize);
+            const gy = Math.floor(y / gridSize);
+
+            const block = getCityBlock(gx, gy);
+            if (!block) return false;
+
+            // Coordenadas locais dentro do bloco [0, gridSize]
+            const lx = x - (gx * gridSize);
+            const ly = y - (gy * gridSize);
+
+            // O prédio está exatamente em [margin, margin + size]
+            return lx > margin && lx < margin + size &&
+                ly > margin && ly < margin + size;
+        }
+
         function updatePhysics() {
             // 1. Input & Basic Handling
             const targetSteer = (inputs.right ? 1 : 0) - (inputs.left ? 1 : 0);
@@ -298,13 +320,48 @@
             }
 
             // 9. Position Update
-            car.x += car.velocity.x;
-            car.y += car.velocity.y;
+            const nextX = car.x + car.velocity.x;
+            const nextY = car.y + car.velocity.y;
+
+            // Verificação de colisão nos 4 cantos do carro para precisão
+            const cos = Math.cos(car.angle);
+            const sin = Math.sin(car.angle);
+            const hw = car.width / 2;
+            const hl = car.length / 2;
+
+            const corners = [
+                { nx: nextX + (hl * cos - hw * sin), ny: nextY + (hl * sin + hw * cos) },
+                { nx: nextX + (hl * cos + hw * sin), ny: nextY + (hl * sin - hw * cos) },
+                { nx: nextX + (-hl * cos - hw * sin), ny: nextY + (-hl * sin + hw * cos) },
+                { nx: nextX + (-hl * cos + hw * sin), ny: nextY + (-hl * sin - hw * cos) }
+            ];
+
+            let hasCollided = false;
+            for (const p of corners) {
+                if (checkCollision(p.nx, p.ny)) {
+                    hasCollided = true;
+                    break;
+                }
+            }
+
+            if (!hasCollided) {
+                car.x = nextX;
+                car.y = nextY;
+            } else {
+                // Resposta de colisão: parar o carro e anular velocidade
+                car.velocity.x = 0;
+                car.velocity.y = 0;
+                car.speed = 0;
+            }
 
             // 10. Camera Dynamics (Mass-Spring-Damper)
-            // Target is explicitly centered on car
-            const targetX = car.x - width / 2;
-            const targetY = car.y - height / 2;
+            // Target is explicitly centered on car + Helicopter Hover / Turbulence
+            const time = Date.now() * 0.001;
+            const hoverX = Math.sin(time * 0.5) * 15 + Math.cos(time * 1.2) * 5;
+            const hoverY = Math.cos(time * 0.45) * 15 + Math.sin(time * 1.3) * 5;
+
+            const targetX = (car.x + hoverX) - width / 2;
+            const targetY = (car.y + hoverY) - height / 2;
 
             // Spring params for "Helicopter" feel (Heavy, slightly loose, overshoot capable)
             const springK = 0.03;   // Strength of pull towards target
@@ -514,7 +571,7 @@
                     // Particles are tricky. Smoke should be sorted too ideally.
                     // For now, let's call drawParticles() HERE if it's the car turn?
                     // Or just call drawParticles() before the loop? 
-                    // If particles are strictly "smoke from tires", they are low. 
+                    // If particles are strictly :smoke from tires", they are low. 
                     // Let's draw them BEFORE the sorted loop to be safe (behind buildings).
                     drawCar();
                 } else {
@@ -566,93 +623,70 @@
             ctx.translate(-camera.x, -camera.y);
 
             // Pseudo-3D Radial Extrusion
-            // Calculation of extrusion vector based on relative position to camera center
             const cameraCX = camera.x + width / 2;
             const cameraCY = camera.y + height / 2;
-
-            // Box Center (Relative to world)
             const boxCX = b.x + b.w / 2;
             const boxCY = b.baseY + b.h / 2;
-
-            // Relative Position
             const dx = boxCX - cameraCX;
             const dy = boxCY - cameraCY;
 
-            // Extrusion Factor: Defines "Field of View" strength / "Height" multiplier
-            // Higher factor = more perspective distortion
-            // Adjusted so a 100px tall building looks reasonable
             const fovScale = 0.35;
-
             const extrusionX = (dx * fovScale) * (b.height / 500);
             const extrusionY = (dy * fovScale) * (b.height / 500);
 
-            // Roof Position (Relative to Base)
             const roofX = b.x + extrusionX;
             const roofY = b.baseY + extrusionY;
 
             // Draw Sides (Connecting Base to Roof)
-            // We draw the Convex Hull of the Base Rect and Roof Rect
-            // Or simply draw the 4 faces connecting corners
-
-            ctx.fillStyle = b.color;
-
-            const corners = [
-                { x: 0, y: 0 },
-                { x: b.w, y: 0 },
-                { x: b.w, y: b.h },
-                { x: 0, y: b.h }
+            // Render each wall quad individually to ensure solidity and avoid winding issues
+            const baseCorners = [
+                { x: b.x, y: b.baseY },
+                { x: b.x + b.w, y: b.baseY },
+                { x: b.x + b.w, y: b.baseY + b.h },
+                { x: b.x, y: b.baseY + b.h }
             ];
 
-            // Draw visible faces
-            // Only draw faces that are part of the "outer" shell relative to center
+            const roofCorners = [
+                { x: roofX, y: roofY },
+                { x: roofX + b.w, y: roofY },
+                { x: roofX + b.w, y: roofY + b.h },
+                { x: roofX, y: roofY + b.h }
+            ];
 
-            // Generic approach: Draw quads connecting base corners to roof corners
-            // To ensure correct overlapping (Painter's), we could sort... but simpler: 
-            // Just draw the big solid block shape (Convex Hull) first?
-            // Or just draw the quads. 
-            // Since it's a solid colors, we can just draw the "extrusion polygon" + Roof on top.
+            // Determine wall visibility and draw
+            for (let i = 0; i < 4; i++) {
+                const next = (i + 1) % 4;
 
-            // Better: Draw 4 quads connecting Base Edge to Roof Edge.
-            // Since we fill with solid color, internal overlapping doesn't matter much.
+                // Slightly darker walls to give depth perception
+                ctx.fillStyle = i % 2 === 0 ? b.color : shadeColor(b.color, -10);
 
-            ctx.beginPath();
-            // Start at Base Top-Left
-            corners.forEach((c, i) => {
-                const nextC = corners[(i + 1) % 4];
-
-                const b1x = b.x + c.x;
-                const b1y = b.baseY + c.y;
-                const b2x = b.x + nextC.x;
-                const b2y = b.baseY + nextC.y;
-
-                const r1x = roofX + c.x;
-                const r1y = roofY + c.y;
-                const r2x = roofX + nextC.x;
-                const r2y = roofY + nextC.y;
-
-                // Draw Quad (Side Face)
-                ctx.moveTo(b1x, b1y);
-                ctx.lineTo(b2x, b2y);
-                ctx.lineTo(r2x, r2y);
-                ctx.lineTo(r1x, r1y);
-                ctx.lineTo(b1x, b1y);
-            });
-            ctx.fill();
+                ctx.beginPath();
+                ctx.moveTo(baseCorners[i].x, baseCorners[i].y);
+                ctx.lineTo(baseCorners[next].x, baseCorners[next].y);
+                ctx.lineTo(roofCorners[next].x, roofCorners[next].y);
+                ctx.lineTo(roofCorners[i].x, roofCorners[i].y);
+                ctx.closePath();
+                ctx.fill();
+            }
 
             // Draw Roof
             ctx.fillStyle = b.roofColor;
             ctx.fillRect(roofX, roofY, b.w, b.h);
 
             // Roof Highlight (Edge)
-            ctx.strokeStyle = 'rgba(255,255,255,0.1)';
+            ctx.strokeStyle = 'rgba(255,255,255,0.15)';
             ctx.lineWidth = 1;
             ctx.strokeRect(roofX, roofY, b.w, b.h);
 
-            // Windows / Details (Projected onto the faces?)
-            // This is hard with radial extrusion without texture mapping. 
-            // Skip windows for now to keep the "clean" look requested and correct geometry.
-
             ctx.restore();
+        }
+
+        // Helper for subtle depth
+        function shadeColor(hex, percent) {
+            const rgb = hexToRgb(hex);
+            if (!rgb) return hex;
+            const f = (val) => Math.max(0, Math.min(255, val + percent));
+            return `rgb(${f(rgb.r)},${f(rgb.g)},${f(rgb.b)})`;
         }
 
         function drawDust() {

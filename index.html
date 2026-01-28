@@ -58,10 +58,66 @@
         CONFIG.lightDir.x /= len;
         CONFIG.lightDir.y /= len;
 
+        // --- City System Configuration ---
+        const CITY_CONFIG = {
+            blockSize: 300,
+            roadWidth: 140,
+            buildingInset: 20
+        };
+
+        // Semantic District Generation (Deterministic)
+        function getCityBlock(gx, gy) {
+            // Simple deterministic hash
+            const h = Math.abs(Math.sin(gx * 12.9898 + gy * 78.233) * 43758.5453) % 1;
+            const dist = Math.sqrt(gx * gx + gy * gy);
+
+            // District Types based on distance from center (0,0)
+            let type, height, color, roofColor;
+
+            if (dist < 4) {
+                // Downtown (High density, tall)
+                type = 'downtown';
+                height = 120 + h * 200;
+                color = h > 0.5 ? '#1e293b' : '#334155'; // Slate 800/700
+                roofColor = h > 0.5 ? '#334155' : '#475569';
+            } else if (dist < 8) {
+                // Commercial (Medium)
+                type = 'commercial';
+                height = 60 + h * 100;
+                color = h > 0.5 ? '#475569' : '#525252'; // Slate 600 / Neutral 600
+                roofColor = h > 0.5 ? '#64748b' : '#737373';
+            } else if (dist < 14) {
+                // Residential (Low)
+                type = 'residential';
+                height = 30 + h * 50;
+                color = '#78716c'; // Stone 500
+                roofColor = '#a8a29e';
+            } else {
+                // Outskirts / Industrial
+                if (h < 0.4) return null; // Empty lots
+                type = 'industrial';
+                height = 20 + h * 30;
+                color = '#4b5563'; // Gray 600
+                roofColor = '#6b7280';
+            }
+
+            return { height, color, roofColor, type, h };
+        }
+
+        function hexToRgb(hex) {
+            const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+            return result ? { r: parseInt(result[1], 16), g: parseInt(result[2], 16), b: parseInt(result[3], 16) } : null;
+        }
+
         // --- Game State ---
         let width, height;
 
-        const camera = { x: 0, y: 0 };
+        const camera = {
+            x: 0,
+            y: 0,
+            vx: 0,
+            vy: 0
+        };
 
         const car = {
             x: 0,
@@ -245,11 +301,25 @@
             car.x += car.velocity.x;
             car.y += car.velocity.y;
 
-            // 10. Camera
-            const lookaheadX = car.velocity.x * 20;
-            const lookaheadY = car.velocity.y * 20;
-            camera.x = lerp(camera.x, (car.x + lookaheadX) - width / 2, 0.08);
-            camera.y = lerp(camera.y, (car.y + lookaheadY) - height / 2, 0.08);
+            // 10. Camera Dynamics (Mass-Spring-Damper)
+            // Target is explicitly centered on car
+            const targetX = car.x - width / 2;
+            const targetY = car.y - height / 2;
+
+            // Spring params for "Helicopter" feel (Heavy, slightly loose, overshoot capable)
+            const springK = 0.03;   // Strength of pull towards target
+            const damping = 0.88;   // Resistance (Inertia preservation)
+
+            const ax = (targetX - camera.x) * springK;
+            const ay = (targetY - camera.y) * springK;
+
+            camera.vx += ax;
+            camera.vy += ay;
+            camera.vx *= damping;
+            camera.vy *= damping;
+
+            camera.x += camera.vx;
+            camera.y += camera.vy;
         }
 
         // --- Particle System ---
@@ -329,37 +399,95 @@
 
         // --- Rendering ---
 
-        function drawGround() {
-            // Draw background color
-            ctx.fillStyle = CONFIG.groundColor;
-            ctx.fillRect(0, 0, width, height);
+        function drawCitySystem() {
+            const gridSize = CITY_CONFIG.blockSize;
+            // 1. Calculate Grid Range
+            const startCol = Math.floor((camera.x) / gridSize) - 1;
+            const endCol = Math.floor((camera.x + width) / gridSize) + 1;
+            const startRow = Math.floor((camera.y) / gridSize) - 1;
+            const endRow = Math.floor((camera.y + height) / gridSize) + 1;
 
-            // Draw Grid (World Space)
+            const renderList = [];
+
+            // 2. Identify Renderable Entities
+            for (let c = startCol; c <= endCol; c++) {
+                for (let r = startRow; r <= endRow; r++) {
+                    const block = getCityBlock(c, r);
+                    if (block) {
+                        const bx = c * gridSize;
+                        const by = r * gridSize;
+                        const size = gridSize - CITY_CONFIG.roadWidth;
+                        const cx = bx + CITY_CONFIG.roadWidth / 2;
+                        const cy = by + CITY_CONFIG.roadWidth / 2;
+
+                        // Add Building to list
+                        renderList.push({
+                            type: 'building',
+                            y: cy + size, // Sort by bottom edge (Z-index base)
+                            x: cx,
+                            baseY: cy,
+                            w: size,
+                            h: size, // width/depth are same for square blocks
+                            height: block.height,
+                            color: block.color,
+                            roofColor: block.roofColor
+                        });
+                    }
+                }
+            }
+
+            // Add Car to Render List
+            // Car Y sort base: Center + half width (approx bottom)
+            // Existing car drawing uses center (car.x, car.y).
+            // We use simple sort based on Y.
+            renderList.push({
+                type: 'car',
+                y: car.y + car.width / 2
+            });
+
+            // 3. Sort by Y (Painter's Algorithm)
+            renderList.sort((a, b) => a.y - b.y);
+
+            // 4. Draw Background Layer (Ground + Roads)
+            drawEnhancedGround(startCol, endCol, startRow, endRow);
+
+            // Draw Ambience (Dust/Speed lines) on top of roads, below shadows/objects
+            drawDust();
+
+            // 5. Draw Shadows (All at once on ground layer)
+            // Car Shadow
+            drawShadow();
+
+            // Building Shadows
+            ctx.fillStyle = CONFIG.shadowColor;
             ctx.save();
             ctx.translate(-camera.x, -camera.y);
+            renderList.forEach(item => {
+                if (item.type === 'building') {
+                    // Simple ground shadow based on orthogonal light
+                    const sx = item.height * CONFIG.lightDir.x;
+                    const sy = item.height * CONFIG.lightDir.y;
 
-            ctx.strokeStyle = CONFIG.gridColor;
-            ctx.lineWidth = 2;
-            const gridSize = 100;
+                    // The shadow simply extends from the base in light direction
+                    // Shadow is the "volume" extruded on ground
+                    ctx.beginPath();
+                    ctx.moveTo(item.x, item.baseY);
+                    ctx.lineTo(item.x + item.w, item.baseY);
+                    ctx.lineTo(item.x + item.w + sx, item.baseY + sy);
+                    ctx.lineTo(item.x + sx, item.baseY + sy);
+                    ctx.closePath();
+                    // ctx.fill(); // This defines the "far" edge, but we need the whole rect
 
-            // Calculate visible range
-            const startX = Math.floor(camera.x / gridSize) * gridSize;
-            const startY = Math.floor(camera.y / gridSize) * gridSize;
-            const endX = startX + width + gridSize;
-            const endY = startY + height + gridSize;
+                    const shadX = item.x + sx;
+                    const shadY = item.baseY + sy;
+                    ctx.fillRect(shadX, shadY, item.w, item.h);
+                }
+            });
+            ctx.restore();
 
-            ctx.beginPath();
-            for (let x = startX; x <= endX; x += gridSize) {
-                ctx.moveTo(x, startY);
-                ctx.lineTo(x, endY);
-            }
-            for (let y = startY; y <= endY; y += gridSize) {
-                ctx.moveTo(startX, y);
-                ctx.lineTo(endX, y);
-            }
-            ctx.stroke();
-
-            // Draw Skid Marks
+            // 6. Draw Skid Marks (On top of shadows, below objects)
+            ctx.save();
+            ctx.translate(-camera.x, -camera.y);
             for (const s of skidMarks) {
                 ctx.fillStyle = `rgba(10, 10, 10, ${s.life * 0.5})`;
                 ctx.save();
@@ -368,6 +496,161 @@
                 ctx.fillRect(-4, -4, 8, 8);
                 ctx.restore();
             }
+            ctx.restore();
+
+            // Draw Particles (Smoke/Sparks) - Before sorted objects (behind buildings/cars?) 
+            // Original: Ground -> Shadow -> Particles -> Car. 
+            // So particles are "behind" Car? Yes.
+            // But they should be ABOVE shadows/skids.
+            drawParticles();
+
+            // 7. Draw Sorted Objects
+            renderList.forEach(item => {
+                if (item.type === 'car') {
+                    // Car manages its own camera transform? No, drawCar does "ctx.translate(-camera.x...)"
+                    drawParticles(); // Draw particles behind car (as originally) ??? 
+                    // Original order: Ground, Dust, Shadow, Particles, Car.
+                    // New order: Ground, Shadows, Skids, Sorted(Buildings, Car).
+                    // Particles are tricky. Smoke should be sorted too ideally.
+                    // For now, let's call drawParticles() HERE if it's the car turn?
+                    // Or just call drawParticles() before the loop? 
+                    // If particles are strictly "smoke from tires", they are low. 
+                    // Let's draw them BEFORE the sorted loop to be safe (behind buildings).
+                    drawCar();
+                } else {
+                    drawBuilding(item);
+                }
+            });
+        }
+
+        function drawEnhancedGround(sc, ec, sr, er) {
+            // Background
+            ctx.fillStyle = CONFIG.groundColor;
+            ctx.fillRect(0, 0, width, height);
+
+            ctx.save();
+            ctx.translate(-camera.x, -camera.y);
+
+            const gridSize = CITY_CONFIG.blockSize;
+            const roadW = CITY_CONFIG.roadWidth;
+
+            // Draw Roads (Grid Lines)
+            ctx.fillStyle = '#171717'; // Dark Asphalt
+
+            // We iterate broadly to fill the camera view
+            for (let c = sc; c <= ec; c++) {
+                // Vertical Roads
+                const rx = c * gridSize;
+                // Draw vertical strip
+                // Infinite height? No, just loop range
+                const y1 = sr * gridSize;
+                const y2 = er * gridSize + gridSize;
+                ctx.fillRect(rx, y1, roadW, y2 - y1);
+            }
+            for (let r = sr; r <= er; r++) {
+                // Horizontal Roads
+                const ry = r * gridSize;
+                const x1 = sc * gridSize;
+                const x2 = ec * gridSize + gridSize;
+                ctx.fillRect(x1, ry, x2 - x1, roadW);
+            }
+
+            // Sidewalks / Curbs?
+            // Optional detail
+
+            ctx.restore();
+        }
+
+        function drawBuilding(b) {
+            ctx.save();
+            ctx.translate(-camera.x, -camera.y);
+
+            // Pseudo-3D Radial Extrusion
+            // Calculation of extrusion vector based on relative position to camera center
+            const cameraCX = camera.x + width / 2;
+            const cameraCY = camera.y + height / 2;
+
+            // Box Center (Relative to world)
+            const boxCX = b.x + b.w / 2;
+            const boxCY = b.baseY + b.h / 2;
+
+            // Relative Position
+            const dx = boxCX - cameraCX;
+            const dy = boxCY - cameraCY;
+
+            // Extrusion Factor: Defines "Field of View" strength / "Height" multiplier
+            // Higher factor = more perspective distortion
+            // Adjusted so a 100px tall building looks reasonable
+            const fovScale = 0.35;
+
+            const extrusionX = (dx * fovScale) * (b.height / 500);
+            const extrusionY = (dy * fovScale) * (b.height / 500);
+
+            // Roof Position (Relative to Base)
+            const roofX = b.x + extrusionX;
+            const roofY = b.baseY + extrusionY;
+
+            // Draw Sides (Connecting Base to Roof)
+            // We draw the Convex Hull of the Base Rect and Roof Rect
+            // Or simply draw the 4 faces connecting corners
+
+            ctx.fillStyle = b.color;
+
+            const corners = [
+                { x: 0, y: 0 },
+                { x: b.w, y: 0 },
+                { x: b.w, y: b.h },
+                { x: 0, y: b.h }
+            ];
+
+            // Draw visible faces
+            // Only draw faces that are part of the "outer" shell relative to center
+
+            // Generic approach: Draw quads connecting base corners to roof corners
+            // To ensure correct overlapping (Painter's), we could sort... but simpler: 
+            // Just draw the big solid block shape (Convex Hull) first?
+            // Or just draw the quads. 
+            // Since it's a solid colors, we can just draw the "extrusion polygon" + Roof on top.
+
+            // Better: Draw 4 quads connecting Base Edge to Roof Edge.
+            // Since we fill with solid color, internal overlapping doesn't matter much.
+
+            ctx.beginPath();
+            // Start at Base Top-Left
+            corners.forEach((c, i) => {
+                const nextC = corners[(i + 1) % 4];
+
+                const b1x = b.x + c.x;
+                const b1y = b.baseY + c.y;
+                const b2x = b.x + nextC.x;
+                const b2y = b.baseY + nextC.y;
+
+                const r1x = roofX + c.x;
+                const r1y = roofY + c.y;
+                const r2x = roofX + nextC.x;
+                const r2y = roofY + nextC.y;
+
+                // Draw Quad (Side Face)
+                ctx.moveTo(b1x, b1y);
+                ctx.lineTo(b2x, b2y);
+                ctx.lineTo(r2x, r2y);
+                ctx.lineTo(r1x, r1y);
+                ctx.lineTo(b1x, b1y);
+            });
+            ctx.fill();
+
+            // Draw Roof
+            ctx.fillStyle = b.roofColor;
+            ctx.fillRect(roofX, roofY, b.w, b.h);
+
+            // Roof Highlight (Edge)
+            ctx.strokeStyle = 'rgba(255,255,255,0.1)';
+            ctx.lineWidth = 1;
+            ctx.strokeRect(roofX, roofY, b.w, b.h);
+
+            // Windows / Details (Projected onto the faces?)
+            // This is hard with radial extrusion without texture mapping. 
+            // Skip windows for now to keep the "clean" look requested and correct geometry.
 
             ctx.restore();
         }
@@ -557,11 +840,8 @@
             ctx.clearRect(0, 0, width, height);
 
             // Draw Order
-            drawGround();
-            drawDust();
-            drawShadow();
-            drawParticles();
-            drawCar();
+            // Render World (Ground, City, Car sorted)
+            drawCitySystem(); // Handles Ground, Dust, Particles, Shadows, Buildings, Car
 
             requestAnimationFrame(loop);
         }

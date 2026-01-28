@@ -58,170 +58,593 @@
         CONFIG.lightDir.x /= len;
         CONFIG.lightDir.y /= len;
 
-        // --- City System Configuration ---
-        const CITY_CONFIG = {
-            blockSize: 300,
-            roadWidth: 140,
-            buildingInset: 20
+        // --- Semantic World Generation System ---
+        const WORLD_SEED = Date.now();
+
+        // Seeded PRNG for deterministic generation
+        function createPRNG(seed) {
+            let s = seed;
+            return function () {
+                s = (s * 1103515245 + 12345) & 0x7fffffff;
+                return s / 0x7fffffff;
+            };
+        }
+
+        const globalRNG = createPRNG(WORLD_SEED);
+
+        // World configuration
+        const WORLD_CONFIG = {
+            worldSize: 4000,
+            minBlockSize: 80,
+            maxBlockSize: 280,
+            streetWidths: {
+                avenue: 100,
+                street: 60,
+                narrow: 40,
+                alley: 25
+            },
+            buildingPadding: 8,
+            treeClearRadius: 25,
+            bushMinDistance: 12
         };
 
-        // Semantic District Generation (Deterministic)
-        function getCityBlock(gx, gy) {
-            // Simple deterministic hash
-            const h = Math.abs(Math.sin(gx * 12.9898 + gy * 78.233) * 43758.5453) % 1;
-            const dist = Math.sqrt(gx * gx + gy * gy);
+        // Spatial index for fast lookups
+        const SPATIAL_BUCKET_SIZE = 200;
+        const spatialIndex = new Map();
 
-            // District Types based on distance from center (0,0)
-            let type, height, color, roofColor;
+        // World data storage
+        const worldData = {
+            streets: [],
+            blocks: [],
+            parcels: [],
+            buildings: [],
+            walls: [],
+            trees: [],
+            bushes: [],
+            generated: false
+        };
 
-            if (dist < 4) {
-                // Downtown (High density, tall)
-                type = 'downtown';
-                height = 120 + h * 200;
-                color = h > 0.5 ? '#1e293b' : '#334155'; // Slate 800/700
-                roofColor = h > 0.5 ? '#334155' : '#475569';
-            } else if (dist < 8) {
-                // Commercial (Medium)
-                type = 'commercial';
-                height = 60 + h * 100;
-                color = h > 0.5 ? '#475569' : '#525252'; // Slate 600 / Neutral 600
-                roofColor = h > 0.5 ? '#64748b' : '#737373';
-            } else if (dist < 14) {
-                // Residential (Low)
-                type = 'residential';
-                height = 30 + h * 50;
-                color = '#78716c'; // Stone 500
-                roofColor = '#a8a29e';
-            } else {
-                // Outskirts / Industrial
-                if (h < 0.4) return null; // Empty lots
-                type = 'industrial';
-                height = 20 + h * 30;
-                color = '#4b5563'; // Gray 600
-                roofColor = '#6b7280';
+        function addToSpatialIndex(entity) {
+            const bx = Math.floor(entity.x / SPATIAL_BUCKET_SIZE);
+            const by = Math.floor(entity.y / SPATIAL_BUCKET_SIZE);
+            const key = `${bx},${by}`;
+            if (!spatialIndex.has(key)) {
+                spatialIndex.set(key, []);
+            }
+            spatialIndex.get(key).push(entity);
+        }
+
+        function getEntitiesInArea(x, y, radius) {
+            const results = [];
+            const minBx = Math.floor((x - radius) / SPATIAL_BUCKET_SIZE);
+            const maxBx = Math.floor((x + radius) / SPATIAL_BUCKET_SIZE);
+            const minBy = Math.floor((y - radius) / SPATIAL_BUCKET_SIZE);
+            const maxBy = Math.floor((y + radius) / SPATIAL_BUCKET_SIZE);
+
+            for (let bx = minBx; bx <= maxBx; bx++) {
+                for (let by = minBy; by <= maxBy; by++) {
+                    const key = `${bx},${by}`;
+                    if (spatialIndex.has(key)) {
+                        results.push(...spatialIndex.get(key));
+                    }
+                }
+            }
+            return results;
+        }
+
+        // Check if rectangle overlaps with existing entities
+        function checkOverlap(x, y, w, h, padding = 0) {
+            const entities = getEntitiesInArea(x + w / 2, y + h / 2, Math.max(w, h) + padding);
+            for (const e of entities) {
+                const ew = e.width || e.w || (e.crownSize ? e.crownSize * 2 : 20);
+                const eh = e.depth || e.h || (e.crownSize ? e.crownSize * 2 : 20);
+                const ex = e.x - (e.width ? 0 : ew / 2);
+                const ey = e.y - (e.depth ? 0 : eh / 2);
+
+                if (x < ex + ew + padding && x + w + padding > ex &&
+                    y < ey + eh + padding && y + h + padding > ey) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // Generate hierarchical street network using recursive subdivision
+        function generateStreets(rng) {
+            const streets = [];
+            const halfWorld = WORLD_CONFIG.worldSize / 2;
+
+            // Main avenues (cross the entire map)
+            streets.push({
+                type: 'avenue',
+                x: -halfWorld, y: -WORLD_CONFIG.streetWidths.avenue / 2,
+                width: WORLD_CONFIG.worldSize, height: WORLD_CONFIG.streetWidths.avenue,
+                orientation: 'horizontal'
+            });
+            streets.push({
+                type: 'avenue',
+                x: -WORLD_CONFIG.streetWidths.avenue / 2, y: -halfWorld,
+                width: WORLD_CONFIG.streetWidths.avenue, height: WORLD_CONFIG.worldSize,
+                orientation: 'vertical'
+            });
+
+            // Recursive subdivision to create blocks
+            function subdivide(bounds, depth) {
+                const { x, y, w, h } = bounds;
+
+                if (depth > 5) return;
+                if (w < WORLD_CONFIG.minBlockSize * 2.5 || h < WORLD_CONFIG.minBlockSize * 2.5) return;
+
+                const splitVertical = rng() > 0.5 ? (w > h * 1.3) : (w > h * 0.7);
+
+                if (splitVertical && w > WORLD_CONFIG.minBlockSize * 2.5) {
+                    const streetType = depth < 2 ? 'street' : (rng() > 0.7 ? 'narrow' : 'street');
+                    const streetW = WORLD_CONFIG.streetWidths[streetType];
+                    const splitPos = x + WORLD_CONFIG.minBlockSize + rng() * (w - WORLD_CONFIG.minBlockSize * 2 - streetW);
+
+                    streets.push({
+                        type: streetType,
+                        x: splitPos, y: y,
+                        width: streetW, height: h,
+                        orientation: 'vertical'
+                    });
+
+                    subdivide({ x, y, w: splitPos - x, h }, depth + 1);
+                    subdivide({ x: splitPos + streetW, y, w: x + w - splitPos - streetW, h }, depth + 1);
+                } else if (h > WORLD_CONFIG.minBlockSize * 2.5) {
+                    const streetType = depth < 2 ? 'street' : (rng() > 0.7 ? 'narrow' : 'street');
+                    const streetH = WORLD_CONFIG.streetWidths[streetType];
+                    const splitPos = y + WORLD_CONFIG.minBlockSize + rng() * (h - WORLD_CONFIG.minBlockSize * 2 - streetH);
+
+                    streets.push({
+                        type: streetType,
+                        x: x, y: splitPos,
+                        width: w, height: streetH,
+                        orientation: 'horizontal'
+                    });
+
+                    subdivide({ x, y, w, h: splitPos - y }, depth + 1);
+                    subdivide({ x, y: splitPos + streetH, w, h: y + h - splitPos - streetH }, depth + 1);
+                }
             }
 
-            return { height, color, roofColor, type, h };
+            // Subdivide each quadrant
+            const quadrantSize = halfWorld - WORLD_CONFIG.streetWidths.avenue / 2;
+            subdivide({ x: -halfWorld, y: -halfWorld, w: quadrantSize, h: quadrantSize }, 0);
+            subdivide({ x: WORLD_CONFIG.streetWidths.avenue / 2, y: -halfWorld, w: quadrantSize, h: quadrantSize }, 0);
+            subdivide({ x: -halfWorld, y: WORLD_CONFIG.streetWidths.avenue / 2, w: quadrantSize, h: quadrantSize }, 0);
+            subdivide({ x: WORLD_CONFIG.streetWidths.avenue / 2, y: WORLD_CONFIG.streetWidths.avenue / 2, w: quadrantSize, h: quadrantSize }, 0);
+
+            // Add occasional alleys
+            for (let i = 0; i < 30; i++) {
+                const baseStreet = streets[Math.floor(rng() * streets.length)];
+                if (baseStreet.type === 'alley') continue;
+
+                const alleyW = WORLD_CONFIG.streetWidths.alley;
+                if (baseStreet.orientation === 'horizontal') {
+                    const ax = baseStreet.x + rng() * (baseStreet.width - 50);
+                    const ay = baseStreet.y + baseStreet.height;
+                    const ah = 40 + rng() * 80;
+                    streets.push({ type: 'alley', x: ax, y: ay, width: alleyW, height: ah, orientation: 'vertical' });
+                } else {
+                    const ax = baseStreet.x + baseStreet.width;
+                    const ay = baseStreet.y + rng() * (baseStreet.height - 50);
+                    const aw = 40 + rng() * 80;
+                    streets.push({ type: 'alley', x: ax, y: ay, width: aw, height: alleyW, orientation: 'horizontal' });
+                }
+            }
+
+            return streets;
+        }
+
+        // Identify blocks from street network
+        function identifyBlocks(streets, rng) {
+            const blocks = [];
+            const halfWorld = WORLD_CONFIG.worldSize / 2;
+            const gridStep = 50;
+
+            function isOnStreet(px, py) {
+                for (const s of streets) {
+                    if (px >= s.x && px <= s.x + s.width && py >= s.y && py <= s.y + s.height) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+
+            const visited = new Set();
+
+            for (let scanY = -halfWorld + 20; scanY < halfWorld; scanY += gridStep) {
+                for (let scanX = -halfWorld + 20; scanX < halfWorld; scanX += gridStep) {
+                    if (isOnStreet(scanX, scanY)) continue;
+
+                    const key = `${Math.floor(scanX / gridStep)},${Math.floor(scanY / gridStep)}`;
+                    if (visited.has(key)) continue;
+                    visited.add(key);
+
+                    // Find block bounds
+                    let minX = scanX, maxX = scanX, minY = scanY, maxY = scanY;
+
+                    while (minX > -halfWorld && !isOnStreet(minX - 5, scanY)) minX -= 5;
+                    while (maxX < halfWorld && !isOnStreet(maxX + 5, scanY)) maxX += 5;
+                    while (minY > -halfWorld && !isOnStreet(scanX, minY - 5)) minY -= 5;
+                    while (maxY < halfWorld && !isOnStreet(scanX, maxY + 5)) maxY += 5;
+
+                    const w = maxX - minX;
+                    const h = maxY - minY;
+
+                    if (w < WORLD_CONFIG.minBlockSize * 0.5 || h < WORLD_CONFIG.minBlockSize * 0.5) continue;
+                    if (w > WORLD_CONFIG.maxBlockSize * 2 || h > WORLD_CONFIG.maxBlockSize * 2) continue;
+
+                    // Check for duplicate blocks
+                    const isDuplicate = blocks.some(b =>
+                        Math.abs(b.x - minX) < 30 && Math.abs(b.y - minY) < 30
+                    );
+                    if (isDuplicate) continue;
+
+                    // District type based on distance from center
+                    const dist = Math.sqrt((minX + w / 2) ** 2 + (minY + h / 2) ** 2);
+                    let districtType;
+                    if (dist < 400) districtType = 'downtown';
+                    else if (dist < 1000) districtType = 'commercial';
+                    else if (dist < 1800) districtType = 'residential';
+                    else districtType = 'industrial';
+
+                    blocks.push({
+                        x: minX, y: minY, w, h,
+                        districtType,
+                        density: rng()
+                    });
+                }
+            }
+
+            return blocks;
+        }
+
+        // Subdivide blocks into parcels
+        function subdivideParcels(blocks, rng) {
+            const parcels = [];
+
+            for (const block of blocks) {
+                const padding = WORLD_CONFIG.buildingPadding;
+                const innerX = block.x + padding;
+                const innerY = block.y + padding;
+                const innerW = block.w - padding * 2;
+                const innerH = block.h - padding * 2;
+
+                if (innerW < 40 || innerH < 40) {
+                    parcels.push({ ...block, x: innerX, y: innerY, w: innerW, h: innerH, parentBlock: block });
+                    continue;
+                }
+
+                // Decide parcel layout based on block shape and district
+                const aspect = innerW / innerH;
+                const subdivisions = block.districtType === 'downtown' ? 1 :
+                    (block.districtType === 'commercial' ? (rng() > 0.5 ? 2 : 1) :
+                        (rng() > 0.3 ? 2 : (rng() > 0.5 ? 3 : 1)));
+
+                if (subdivisions === 1 || (innerW < 80 && innerH < 80)) {
+                    parcels.push({ x: innerX, y: innerY, w: innerW, h: innerH, parentBlock: block });
+                } else if (aspect > 1.5) {
+                    // Wide block: vertical splits
+                    const pw = innerW / subdivisions;
+                    for (let i = 0; i < subdivisions; i++) {
+                        parcels.push({
+                            x: innerX + i * pw + (i > 0 ? 4 : 0),
+                            y: innerY,
+                            w: pw - (i > 0 && i < subdivisions - 1 ? 8 : 4),
+                            h: innerH,
+                            parentBlock: block
+                        });
+                    }
+                } else if (aspect < 0.67) {
+                    // Tall block: horizontal splits
+                    const ph = innerH / subdivisions;
+                    for (let i = 0; i < subdivisions; i++) {
+                        parcels.push({
+                            x: innerX,
+                            y: innerY + i * ph + (i > 0 ? 4 : 0),
+                            w: innerW,
+                            h: ph - (i > 0 && i < subdivisions - 1 ? 8 : 4),
+                            parentBlock: block
+                        });
+                    }
+                } else {
+                    // Square-ish: grid
+                    const cols = Math.round(Math.sqrt(subdivisions * aspect));
+                    const rows = Math.max(1, Math.round(subdivisions / cols));
+                    const pw = innerW / cols;
+                    const ph = innerH / rows;
+                    for (let r = 0; r < rows; r++) {
+                        for (let c = 0; c < cols; c++) {
+                            parcels.push({
+                                x: innerX + c * pw + 3,
+                                y: innerY + r * ph + 3,
+                                w: pw - 6,
+                                h: ph - 6,
+                                parentBlock: block
+                            });
+                        }
+                    }
+                }
+            }
+
+            return parcels;
+        }
+
+        // Place buildings on parcels
+        function placeBuildings(parcels, rng) {
+            const buildings = [];
+
+            for (const parcel of parcels) {
+                if (parcel.w < 30 || parcel.h < 30) continue;
+                if (rng() < 0.15) continue; // Some empty lots
+
+                const district = parcel.parentBlock.districtType;
+                const padding = 5;
+
+                // Building size based on parcel and district
+                let bw, bh, height;
+
+                if (district === 'downtown') {
+                    bw = parcel.w - padding * 2;
+                    bh = parcel.h - padding * 2;
+                    height = 100 + rng() * 180;
+                } else if (district === 'commercial') {
+                    bw = (parcel.w - padding * 2) * (0.7 + rng() * 0.25);
+                    bh = (parcel.h - padding * 2) * (0.7 + rng() * 0.25);
+                    height = 50 + rng() * 100;
+                } else if (district === 'residential') {
+                    bw = Math.min(parcel.w - padding * 2, 40 + rng() * 40);
+                    bh = Math.min(parcel.h - padding * 2, 35 + rng() * 35);
+                    height = 25 + rng() * 40;
+                } else {
+                    bw = (parcel.w - padding * 2) * (0.5 + rng() * 0.4);
+                    bh = (parcel.h - padding * 2) * (0.5 + rng() * 0.4);
+                    height = 15 + rng() * 25;
+                }
+
+                // Align to street (place at edge of parcel)
+                const alignX = rng() > 0.5 ? parcel.x + padding : parcel.x + parcel.w - bw - padding;
+                const alignY = rng() > 0.5 ? parcel.y + padding : parcel.y + parcel.h - bh - padding;
+
+                // Color based on district
+                const colorSets = {
+                    downtown: [['#1e293b', '#334155'], ['#0f172a', '#1e293b']],
+                    commercial: [['#475569', '#64748b'], ['#525252', '#737373']],
+                    residential: [['#78716c', '#a8a29e'], ['#57534e', '#78716c']],
+                    industrial: [['#4b5563', '#6b7280'], ['#374151', '#4b5563']]
+                };
+                const colorSet = colorSets[district][Math.floor(rng() * 2)];
+
+                buildings.push({
+                    type: 'building',
+                    x: alignX,
+                    y: alignY,
+                    w: bw,
+                    h: bh,
+                    height,
+                    color: colorSet[0],
+                    roofColor: colorSet[1],
+                    baseY: alignY
+                });
+            }
+
+            return buildings;
+        }
+
+        // Place walls as spatial delimiters
+        function placeWalls(parcels, buildings, rng) {
+            const walls = [];
+
+            for (const parcel of parcels) {
+                if (rng() > 0.35) continue; // 35% chance of walls
+
+                const wallHeight = 12 + rng() * 15;
+                const wallColor = rng() > 0.5 ? '#78716c' : '#a8a29e';
+                const wallDepth = 6;
+
+                // Check which edges to wall
+                const edges = [];
+                if (rng() > 0.4) edges.push('top');
+                if (rng() > 0.4) edges.push('left');
+                if (rng() > 0.6) edges.push('bottom');
+                if (rng() > 0.6) edges.push('right');
+
+                for (const edge of edges) {
+                    let wx, wy, ww, wd;
+
+                    if (edge === 'top') {
+                        wx = parcel.x; wy = parcel.y - wallDepth;
+                        ww = parcel.w; wd = wallDepth;
+                    } else if (edge === 'left') {
+                        wx = parcel.x - wallDepth; wy = parcel.y;
+                        ww = wallDepth; wd = parcel.h;
+                    } else if (edge === 'bottom') {
+                        wx = parcel.x; wy = parcel.y + parcel.h;
+                        ww = parcel.w; wd = wallDepth;
+                    } else {
+                        wx = parcel.x + parcel.w; wy = parcel.y;
+                        ww = wallDepth; wd = parcel.h;
+                    }
+
+                    // Check overlap with buildings
+                    const overlaps = buildings.some(b =>
+                        wx < b.x + b.w + 5 && wx + ww + 5 > b.x &&
+                        wy < b.y + b.h + 5 && wy + wd + 5 > b.y
+                    );
+
+                    if (!overlaps) {
+                        walls.push({
+                            type: 'wall',
+                            x: wx, y: wy,
+                            width: ww, depth: wd,
+                            height: wallHeight,
+                            color: wallColor
+                        });
+                    }
+                }
+            }
+
+            return walls;
+        }
+
+        // Place trees intelligently
+        function placeTrees(streets, buildings, walls, rng) {
+            const trees = [];
+            const clearRadius = WORLD_CONFIG.treeClearRadius;
+
+            // Trees along streets
+            for (const street of streets) {
+                if (street.type === 'alley') continue;
+
+                const spacing = street.type === 'avenue' ? 80 : 60;
+                const offset = street.type === 'avenue' ? 15 : 10;
+
+                if (street.orientation === 'horizontal') {
+                    for (let x = street.x + 30; x < street.x + street.width - 30; x += spacing) {
+                        if (rng() > 0.6) continue;
+
+                        const ty1 = street.y - offset;
+                        const ty2 = street.y + street.height + offset;
+
+                        for (const ty of [ty1, ty2]) {
+                            if (rng() > 0.5) continue;
+
+                            const treeData = createTreeData(x, ty, rng);
+                            if (!hasNearbyObstacle(x, ty, clearRadius, buildings, walls, trees)) {
+                                trees.push(treeData);
+                            }
+                        }
+                    }
+                } else {
+                    for (let y = street.y + 30; y < street.y + street.height - 30; y += spacing) {
+                        if (rng() > 0.6) continue;
+
+                        const tx1 = street.x - offset;
+                        const tx2 = street.x + street.width + offset;
+
+                        for (const tx of [tx1, tx2]) {
+                            if (rng() > 0.5) continue;
+
+                            const treeData = createTreeData(tx, y, rng);
+                            if (!hasNearbyObstacle(tx, y, clearRadius, buildings, walls, trees)) {
+                                trees.push(treeData);
+                            }
+                        }
+                    }
+                }
+            }
+
+            return trees;
+        }
+
+        function createTreeData(x, y, rng) {
+            return {
+                type: 'tree',
+                x, y,
+                height: 35 + rng() * 30,
+                crownSize: 16 + rng() * 14,
+                trunkWidth: 5 + rng() * 4,
+                color: rng() > 0.5 ? '#166534' : '#15803d',
+                trunkColor: '#78350f'
+            };
+        }
+
+        function hasNearbyObstacle(x, y, radius, buildings, walls, trees) {
+            for (const b of buildings) {
+                if (x > b.x - radius && x < b.x + b.w + radius &&
+                    y > b.y - radius && y < b.y + b.h + radius) return true;
+            }
+            for (const w of walls) {
+                if (x > w.x - radius && x < w.x + w.width + radius &&
+                    y > w.y - radius && y < w.y + w.depth + radius) return true;
+            }
+            for (const t of trees) {
+                const dist = Math.sqrt((x - t.x) ** 2 + (y - t.y) ** 2);
+                if (dist < radius) return true;
+            }
+            return false;
+        }
+
+        // Place bushes in residual spaces
+        function placeBushes(streets, buildings, walls, trees, rng) {
+            const bushes = [];
+            const minDist = WORLD_CONFIG.bushMinDistance;
+
+            // Bushes near walls and building corners
+            for (const wall of walls) {
+                if (rng() > 0.4) continue;
+
+                const numBushes = 1 + Math.floor(rng() * 2);
+                for (let i = 0; i < numBushes; i++) {
+                    const bx = wall.x + rng() * wall.width;
+                    const by = wall.y + rng() * wall.depth + (rng() > 0.5 ? wall.depth + 5 : -15);
+
+                    if (!hasNearbyObstacle(bx, by, minDist, buildings, walls, trees)) {
+                        bushes.push({
+                            type: 'bush',
+                            x: bx, y: by,
+                            width: 12 + rng() * 10,
+                            depth: 10 + rng() * 8,
+                            height: 6 + rng() * 8,
+                            color: rng() > 0.5 ? '#166534' : '#14532d'
+                        });
+                    }
+                }
+            }
+
+            // Additional bushes at street corners
+            for (let i = 0; i < 50; i++) {
+                const street = streets[Math.floor(rng() * streets.length)];
+                if (street.type === 'alley') continue;
+
+                const bx = street.x + (rng() > 0.5 ? -10 : street.width + 5);
+                const by = street.y + (rng() > 0.5 ? -10 : street.height + 5);
+
+                if (!hasNearbyObstacle(bx, by, minDist, buildings, walls, trees)) {
+                    bushes.push({
+                        type: 'bush',
+                        x: bx, y: by,
+                        width: 10 + rng() * 12,
+                        depth: 8 + rng() * 10,
+                        height: 5 + rng() * 7,
+                        color: rng() > 0.5 ? '#166534' : '#14532d'
+                    });
+                }
+            }
+
+            return bushes;
+        }
+
+        // Main world generation function
+        function generateWorld() {
+            if (worldData.generated) return;
+
+            console.log('Generating world with seed:', WORLD_SEED);
+            const rng = createPRNG(WORLD_SEED);
+
+            worldData.streets = generateStreets(rng);
+            worldData.blocks = identifyBlocks(worldData.streets, rng);
+            worldData.parcels = subdivideParcels(worldData.blocks, rng);
+            worldData.buildings = placeBuildings(worldData.parcels, rng);
+            worldData.walls = placeWalls(worldData.parcels, worldData.buildings, rng);
+            worldData.trees = placeTrees(worldData.streets, worldData.buildings, worldData.walls, rng);
+            worldData.bushes = placeBushes(worldData.streets, worldData.buildings, worldData.walls, worldData.trees, rng);
+
+            // Build spatial index
+            for (const b of worldData.buildings) addToSpatialIndex(b);
+            for (const w of worldData.walls) addToSpatialIndex(w);
+            for (const t of worldData.trees) addToSpatialIndex(t);
+            for (const bush of worldData.bushes) addToSpatialIndex(bush);
+
+            worldData.generated = true;
+            console.log(`World generated: ${worldData.buildings.length} buildings, ${worldData.walls.length} walls, ${worldData.trees.length} trees, ${worldData.bushes.length} bushes`);
         }
 
         function hexToRgb(hex) {
             const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
             return result ? { r: parseInt(result[1], 16), g: parseInt(result[2], 16), b: parseInt(result[3], 16) } : null;
-        }
-
-        // --- Environment Items Generation (Trees, Walls, Bushes) ---
-        function getEnvironmentItems(gx, gy) {
-            const items = [];
-            const gridSize = CITY_CONFIG.blockSize;
-            const roadW = CITY_CONFIG.roadWidth;
-            const block = getCityBlock(gx, gy);
-
-            // Hash para variação determinística
-            const hash = (seed) => Math.abs(Math.sin(gx * 127.1 + gy * 311.7 + seed * 758.5) * 43758.5453) % 1;
-
-            const bx = gx * gridSize;
-            const by = gy * gridSize;
-
-            // Posições nas calçadas (margens da estrada)
-            const sidewalkPositions = [
-                // Canto superior esquerdo
-                { x: bx + roadW * 0.25, y: by + roadW * 0.25 },
-                // Canto superior direito
-                { x: bx + gridSize - roadW * 0.25, y: by + roadW * 0.25 },
-                // Canto inferior esquerdo
-                { x: bx + roadW * 0.25, y: by + gridSize - roadW * 0.25 },
-                // Canto inferior direito
-                { x: bx + gridSize - roadW * 0.25, y: by + gridSize - roadW * 0.25 },
-                // Meio das calçadas
-                { x: bx + gridSize / 2, y: by + roadW * 0.3 },
-                { x: bx + roadW * 0.3, y: by + gridSize / 2 },
-            ];
-
-            // Árvores - nas calçadas
-            for (let i = 0; i < sidewalkPositions.length; i++) {
-                const h = hash(i * 10 + 1);
-                if (h > 0.55) continue; // 45% chance de árvore
-
-                const pos = sidewalkPositions[i];
-                const treeHeight = 40 + hash(i * 10 + 2) * 25;
-                const crownSize = 18 + hash(i * 10 + 3) * 12;
-
-                items.push({
-                    type: 'tree',
-                    x: pos.x,
-                    y: pos.y,
-                    height: treeHeight,
-                    crownSize: crownSize,
-                    trunkWidth: 6 + hash(i * 10 + 4) * 4,
-                    color: hash(i * 10 + 5) > 0.5 ? '#166534' : '#15803d', // Green-800/700
-                    trunkColor: '#78350f' // Amber-900
-                });
-            }
-
-            // Muros - bordas das propriedades (se houver prédio)
-            if (block) {
-                const wallH = hash(100);
-                if (wallH < 0.4) { // 40% chance de muro
-                    const wallHeight = 15 + hash(101) * 12;
-                    const wallColor = hash(102) > 0.5 ? '#78716c' : '#a8a29e'; // Stone-500/400
-
-                    // Muro na borda superior do prédio
-                    if (hash(103) > 0.5) {
-                        items.push({
-                            type: 'wall',
-                            x: bx + roadW / 2,
-                            y: by + roadW / 2 - 8,
-                            width: gridSize - roadW,
-                            depth: 8,
-                            height: wallHeight,
-                            color: wallColor
-                        });
-                    }
-
-                    // Muro na borda esquerda do prédio
-                    if (hash(104) > 0.5) {
-                        items.push({
-                            type: 'wall',
-                            x: bx + roadW / 2 - 8,
-                            y: by + roadW / 2,
-                            width: 8,
-                            depth: gridSize - roadW,
-                            height: wallHeight,
-                            color: wallColor
-                        });
-                    }
-                }
-            }
-
-            // Arbustos - junto aos muros e calçadas
-            for (let i = 0; i < 4; i++) {
-                const h = hash(200 + i);
-                if (h > 0.35) continue; // 35% chance
-
-                const bushX = bx + roadW * 0.4 + hash(210 + i) * (gridSize - roadW * 0.8);
-                const bushY = by + roadW * 0.4 + hash(220 + i) * (gridSize - roadW * 0.8);
-
-                // Evitar centro do bloco (onde está o prédio)
-                const localX = bushX - bx;
-                const localY = bushY - by;
-                const margin = roadW / 2;
-                const size = gridSize - roadW;
-                if (localX > margin && localX < margin + size && localY > margin && localY < margin + size) {
-                    continue;
-                }
-
-                items.push({
-                    type: 'bush',
-                    x: bushX,
-                    y: bushY,
-                    width: 15 + hash(230 + i) * 12,
-                    depth: 12 + hash(240 + i) * 8,
-                    height: 8 + hash(250 + i) * 8,
-                    color: hash(260 + i) > 0.5 ? '#166534' : '#14532d' // Green-800/900
-                });
-            }
-
-            return items;
         }
 
         // --- Game State ---
@@ -306,40 +729,25 @@
 
         // --- Physics Engine ---
         function checkCollision(x, y) {
-            const gridSize = CITY_CONFIG.blockSize;
-            const roadW = CITY_CONFIG.roadWidth;
-            const size = gridSize - roadW;
-            const margin = roadW / 2;
+            // Usar índice espacial para buscar entidades próximas
+            const entities = getEntitiesInArea(x, y, 100);
 
-            const gx = Math.floor(x / gridSize);
-            const gy = Math.floor(y / gridSize);
-
-            // Colisão com prédio
-            const block = getCityBlock(gx, gy);
-            if (block) {
-                const lx = x - (gx * gridSize);
-                const ly = y - (gy * gridSize);
-                if (lx > margin && lx < margin + size && ly > margin && ly < margin + size) {
-                    return true;
-                }
-            }
-
-            // Colisão com elementos do ambiente (bloco atual e vizinhos)
-            for (let dx = -1; dx <= 1; dx++) {
-                for (let dy = -1; dy <= 1; dy++) {
-                    const items = getEnvironmentItems(gx + dx, gy + dy);
-                    for (const item of items) {
-                        if (item.type === 'tree') {
-                            // Colisão circular com tronco - um pouco mais generosa para evitar atravessar
-                            const dist = Math.sqrt((x - item.x) ** 2 + (y - item.y) ** 2);
-                            if (dist < item.trunkWidth * 0.8) return true;
-                        } else if (item.type === 'wall') {
-                            // Colisão retangular
-                            if (x > item.x && x < item.x + item.width &&
-                                y > item.y && y < item.y + item.depth) {
-                                return true;
-                            }
-                        }
+            for (const item of entities) {
+                if (item.type === 'building') {
+                    // Colisão retangular com prédio
+                    if (x > item.x && x < item.x + item.w &&
+                        y > item.y && y < item.y + item.h) {
+                        return true;
+                    }
+                } else if (item.type === 'tree') {
+                    // Colisão circular com tronco
+                    const dist = Math.sqrt((x - item.x) ** 2 + (y - item.y) ** 2);
+                    if (dist < item.trunkWidth * 0.8) return true;
+                } else if (item.type === 'wall') {
+                    // Colisão retangular com muro
+                    if (x > item.x && x < item.x + item.width &&
+                        y > item.y && y < item.y + item.depth) {
+                        return true;
                     }
                 }
             }
@@ -614,135 +1022,106 @@
         // --- Rendering ---
 
         function drawCitySystem() {
-            const gridSize = CITY_CONFIG.blockSize;
-            // 1. Calculate Grid Range
-            const startCol = Math.floor((camera.x) / gridSize) - 1;
-            const endCol = Math.floor((camera.x + width) / gridSize) + 1;
-            const startRow = Math.floor((camera.y) / gridSize) - 1;
-            const endRow = Math.floor((camera.y + height) / gridSize) + 1;
+            // Garantir que o mundo foi gerado
+            generateWorld();
 
             const renderList = [];
 
-            // 2. Identify Renderable Entities
-            for (let c = startCol; c <= endCol; c++) {
-                for (let r = startRow; r <= endRow; r++) {
-                    const block = getCityBlock(c, r);
-                    if (block) {
-                        const bx = c * gridSize;
-                        const by = r * gridSize;
-                        const size = gridSize - CITY_CONFIG.roadWidth;
-                        const cx = bx + CITY_CONFIG.roadWidth / 2;
-                        const cy = by + CITY_CONFIG.roadWidth / 2;
+            // Buscar entidades visíveis na área da câmera
+            const viewRadius = Math.max(width, height) * 0.8;
+            const camCenterX = camera.x + width / 2;
+            const camCenterY = camera.y + height / 2;
 
-                        // Add Building to list
-                        renderList.push({
-                            type: 'building',
-                            y: cy + size, // Sort by bottom edge (Z-index base)
-                            x: cx,
-                            baseY: cy,
-                            w: size,
-                            h: size, // width/depth are same for square blocks
-                            height: block.height,
-                            color: block.color,
-                            roofColor: block.roofColor
-                        });
-                    }
-
-                    // Add Environment Items (Trees, Walls, Bushes)
-                    const envItems = getEnvironmentItems(c, r);
-                    for (const item of envItems) {
-                        if (item.type === 'tree') {
-                            renderList.push({
-                                type: 'tree',
-                                y: item.y + item.crownSize / 2,
-                                ...item
-                            });
-                        } else if (item.type === 'wall') {
-                            renderList.push({
-                                type: 'wall',
-                                y: item.y + item.depth,
-                                ...item
-                            });
-                        } else if (item.type === 'bush') {
-                            renderList.push({
-                                type: 'bush',
-                                y: item.y + item.depth / 2,
-                                ...item
-                            });
-                        }
-                    }
+            // Adicionar prédios visíveis
+            for (const building of worldData.buildings) {
+                if (building.x + building.w > camera.x - 200 && building.x < camera.x + width + 200 &&
+                    building.y + building.h > camera.y - 200 && building.y < camera.y + height + 200) {
+                    renderList.push({
+                        ...building,
+                        y: building.baseY + building.h
+                    });
                 }
             }
 
-            // Add Car to Render List
-            // Car Y sort base: Center + half width (approx bottom)
-            // Existing car drawing uses center (car.x, car.y).
-            // We use simple sort based on Y.
+            // Adicionar muros visíveis
+            for (const wall of worldData.walls) {
+                if (wall.x + wall.width > camera.x - 100 && wall.x < camera.x + width + 100 &&
+                    wall.y + wall.depth > camera.y - 100 && wall.y < camera.y + height + 100) {
+                    renderList.push({
+                        ...wall,
+                        y: wall.y + wall.depth
+                    });
+                }
+            }
+
+            // Adicionar árvores visíveis
+            for (const tree of worldData.trees) {
+                if (tree.x > camera.x - 100 && tree.x < camera.x + width + 100 &&
+                    tree.y > camera.y - 100 && tree.y < camera.y + height + 100) {
+                    renderList.push({
+                        ...tree,
+                        y: tree.y + tree.crownSize / 2
+                    });
+                }
+            }
+
+            // Adicionar arbustos visíveis
+            for (const bush of worldData.bushes) {
+                if (bush.x > camera.x - 50 && bush.x < camera.x + width + 50 &&
+                    bush.y > camera.y - 50 && bush.y < camera.y + height + 50) {
+                    renderList.push({
+                        ...bush,
+                        y: bush.y + bush.depth / 2
+                    });
+                }
+            }
+
+            // Adicionar carro à lista de renderização
             renderList.push({
                 type: 'car',
                 y: car.y + car.width / 2
             });
 
-            // 3. Sort by Y (Painter's Algorithm)
+            // Ordenar por Y (Painter's Algorithm)
             renderList.sort((a, b) => a.y - b.y);
 
-            // 4. Draw Background Layer (Ground + Roads)
-            drawEnhancedGround(startCol, endCol, startRow, endRow);
+            // Desenhar fundo (chão + ruas)
+            drawEnhancedGround();
 
-            // Draw Ambience (Dust/Speed lines) on top of roads, below shadows/objects
+            // Desenhar poeira/linhas de velocidade
             drawDust();
 
-            // 5. Draw Shadows (All at once on ground layer)
-            // Car Shadow
+            // Desenhar sombras
             drawShadow();
 
-            // Building and Environment Shadows
+            // Sombras de prédios e ambiente
             ctx.fillStyle = CONFIG.shadowColor;
             ctx.save();
             ctx.translate(-camera.x, -camera.y);
             renderList.forEach(item => {
                 if (item.type === 'building') {
-                    // Simple ground shadow based on orthogonal light
                     const sx = item.height * CONFIG.lightDir.x;
                     const sy = item.height * CONFIG.lightDir.y;
-
-                    // The shadow simply extends from the base in light direction
-                    // Shadow is the "volume" extruded on ground
-                    ctx.beginPath();
-                    ctx.moveTo(item.x, item.baseY);
-                    ctx.lineTo(item.x + item.w, item.baseY);
-                    ctx.lineTo(item.x + item.w + sx, item.baseY + sy);
-                    ctx.lineTo(item.x + sx, item.baseY + sy);
-                    ctx.closePath();
-                    // ctx.fill(); // This defines the "far" edge, but we need the whole rect
-
                     const shadX = item.x + sx;
                     const shadY = item.baseY + sy;
                     ctx.fillRect(shadX, shadY, item.w, item.h);
                 } else if (item.type === 'tree') {
-                    // Sombra combinada (Tronco + Copa)
                     const sx = item.height * CONFIG.lightDir.x * 0.6;
                     const sy = item.height * CONFIG.lightDir.y * 0.6;
-
-                    // 1. Unificar sombra do tronco e da copa em um único path para evitar sobreposição de alpha
                     const tw = item.trunkWidth / 2;
                     ctx.beginPath();
-                    // Tronco
                     ctx.moveTo(item.x - tw, item.y);
                     ctx.lineTo(item.x + tw, item.y);
                     ctx.lineTo(item.x + tw + sx, item.y + sy);
                     ctx.lineTo(item.x - tw + sx, item.y + sy);
                     ctx.closePath();
-                    // Copa
                     ctx.ellipse(item.x + sx, item.y + sy, item.crownSize, item.crownSize * 0.7, 0, 0, Math.PI * 2);
                     ctx.fill();
                 } else if (item.type === 'wall') {
-                    // Sombra retangular
                     const sx = item.height * CONFIG.lightDir.x;
                     const sy = item.height * CONFIG.lightDir.y;
                     ctx.fillRect(item.x + sx, item.y + sy, item.width, item.depth);
                 } else if (item.type === 'bush') {
-                    // Sombra elíptica pequena
                     const sx = item.height * CONFIG.lightDir.x * 0.5;
                     const sy = item.height * CONFIG.lightDir.y * 0.5;
                     ctx.beginPath();
@@ -752,7 +1131,7 @@
             });
             ctx.restore();
 
-            // 6. Draw Skid Marks (On top of shadows, below objects)
+            // Desenhar marcas de derrapagem
             ctx.save();
             ctx.translate(-camera.x, -camera.y);
             for (const s of skidMarks) {
@@ -765,13 +1144,10 @@
             }
             ctx.restore();
 
-            // Draw Particles (Smoke/Sparks) - Before sorted objects (behind buildings/cars?) 
-            // Original: Ground -> Shadow -> Particles -> Car. 
-            // So particles are "behind" Car? Yes.
-            // But they should be ABOVE shadows/skids.
+            // Desenhar partículas
             drawParticles();
 
-            // 7. Draw Sorted Objects
+            // Desenhar objetos ordenados
             renderList.forEach(item => {
                 if (item.type === 'car') {
                     drawParticles();
@@ -788,40 +1164,35 @@
             });
         }
 
-        function drawEnhancedGround(sc, ec, sr, er) {
-            // Background
+        function drawEnhancedGround() {
+            // Fundo
             ctx.fillStyle = CONFIG.groundColor;
             ctx.fillRect(0, 0, width, height);
 
             ctx.save();
             ctx.translate(-camera.x, -camera.y);
 
-            const gridSize = CITY_CONFIG.blockSize;
-            const roadW = CITY_CONFIG.roadWidth;
+            // Desenhar ruas do worldData
+            ctx.fillStyle = '#171717'; // Asfalto escuro
 
-            // Draw Roads (Grid Lines)
-            ctx.fillStyle = '#171717'; // Dark Asphalt
+            for (const street of worldData.streets) {
+                // Só desenhar ruas visíveis
+                if (street.x + street.width > camera.x - 50 && street.x < camera.x + width + 50 &&
+                    street.y + street.height > camera.y - 50 && street.y < camera.y + height + 50) {
+                    ctx.fillRect(street.x, street.y, street.width, street.height);
 
-            // We iterate broadly to fill the camera view
-            for (let c = sc; c <= ec; c++) {
-                // Vertical Roads
-                const rx = c * gridSize;
-                // Draw vertical strip
-                // Infinite height? No, just loop range
-                const y1 = sr * gridSize;
-                const y2 = er * gridSize + gridSize;
-                ctx.fillRect(rx, y1, roadW, y2 - y1);
+                    // Linha central para avenidas
+                    if (street.type === 'avenue') {
+                        ctx.fillStyle = '#333';
+                        if (street.orientation === 'horizontal') {
+                            ctx.fillRect(street.x, street.y + street.height / 2 - 2, street.width, 4);
+                        } else {
+                            ctx.fillRect(street.x + street.width / 2 - 2, street.y, 4, street.height);
+                        }
+                        ctx.fillStyle = '#171717';
+                    }
+                }
             }
-            for (let r = sr; r <= er; r++) {
-                // Horizontal Roads
-                const ry = r * gridSize;
-                const x1 = sc * gridSize;
-                const x2 = ec * gridSize + gridSize;
-                ctx.fillRect(x1, ry, x2 - x1, roadW);
-            }
-
-            // Sidewalks / Curbs?
-            // Optional detail
 
             ctx.restore();
         }

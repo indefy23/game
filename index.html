@@ -1,16 +1,34 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Arcade Chase: Orthographic Drift</title>
     <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
     <style>
-        body { margin: 0; overflow: hidden; background-color: #2d2d2d; }
-        canvas { display: block; }
-        .ui { position: absolute; top: 20px; left: 20px; color: white; font-family: monospace; pointer-events: none; user-select: none; }
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #2d2d2d;
+        }
+
+        canvas {
+            display: block;
+        }
+
+        .ui {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            color: white;
+            font-family: monospace;
+            pointer-events: none;
+            user-select: none;
+        }
     </style>
 </head>
+
 <body>
     <div class="ui">
         <h1 class="text-2xl font-bold text-yellow-400">DRIFT PROTOCOL</h1>
@@ -22,7 +40,7 @@
     <script>
         const canvas = document.getElementById('gameCanvas');
         const ctx = canvas.getContext('2d', { alpha: false }); // Optimize for no transparency on base
-        
+
         // --- Configuration ---
         const CONFIG = {
             lightDir: { x: 1, y: 1 }, // Light coming from top-left (so shadow goes bottom-right)
@@ -36,17 +54,611 @@
         };
 
         // Normalize light direction
-        const len = Math.sqrt(CONFIG.lightDir.x**2 + CONFIG.lightDir.y**2);
+        const len = Math.sqrt(CONFIG.lightDir.x ** 2 + CONFIG.lightDir.y ** 2);
         CONFIG.lightDir.x /= len;
         CONFIG.lightDir.y /= len;
 
+        // --- Semantic World Generation System ---
+        const WORLD_SEED = Date.now();
+
+        // Seeded PRNG for deterministic generation
+        function createPRNG(seed) {
+            let s = seed;
+            return function () {
+                s = (s * 1103515245 + 12345) & 0x7fffffff;
+                return s / 0x7fffffff;
+            };
+        }
+
+        const globalRNG = createPRNG(WORLD_SEED);
+
+        // World configuration
+        const WORLD_CONFIG = {
+            worldSize: 4000,
+            minBlockSize: 80,
+            maxBlockSize: 280,
+            streetWidths: {
+                avenue: 100,
+                street: 60,
+                narrow: 40,
+                alley: 25
+            },
+            buildingPadding: 8,
+            treeClearRadius: 25,
+            bushMinDistance: 12
+        };
+
+        // Spatial index for fast lookups
+        const SPATIAL_BUCKET_SIZE = 200;
+        const spatialIndex = new Map();
+
+        // World data storage
+        const worldData = {
+            streets: [],
+            blocks: [],
+            parcels: [],
+            buildings: [],
+            walls: [],
+            trees: [],
+            bushes: [],
+            generated: false
+        };
+
+        function addToSpatialIndex(entity) {
+            const bx = Math.floor(entity.x / SPATIAL_BUCKET_SIZE);
+            const by = Math.floor(entity.y / SPATIAL_BUCKET_SIZE);
+            const key = `${bx},${by}`;
+            if (!spatialIndex.has(key)) {
+                spatialIndex.set(key, []);
+            }
+            spatialIndex.get(key).push(entity);
+        }
+
+        function getEntitiesInArea(x, y, radius) {
+            const results = [];
+            const minBx = Math.floor((x - radius) / SPATIAL_BUCKET_SIZE);
+            const maxBx = Math.floor((x + radius) / SPATIAL_BUCKET_SIZE);
+            const minBy = Math.floor((y - radius) / SPATIAL_BUCKET_SIZE);
+            const maxBy = Math.floor((y + radius) / SPATIAL_BUCKET_SIZE);
+
+            for (let bx = minBx; bx <= maxBx; bx++) {
+                for (let by = minBy; by <= maxBy; by++) {
+                    const key = `${bx},${by}`;
+                    if (spatialIndex.has(key)) {
+                        results.push(...spatialIndex.get(key));
+                    }
+                }
+            }
+            return results;
+        }
+
+        // Check if rectangle overlaps with existing entities
+        function checkOverlap(x, y, w, h, padding = 0) {
+            const entities = getEntitiesInArea(x + w / 2, y + h / 2, Math.max(w, h) + padding);
+            for (const e of entities) {
+                const ew = e.width || e.w || (e.crownSize ? e.crownSize * 2 : 20);
+                const eh = e.depth || e.h || (e.crownSize ? e.crownSize * 2 : 20);
+                const ex = e.x - (e.width ? 0 : ew / 2);
+                const ey = e.y - (e.depth ? 0 : eh / 2);
+
+                if (x < ex + ew + padding && x + w + padding > ex &&
+                    y < ey + eh + padding && y + h + padding > ey) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // Generate hierarchical street network using recursive subdivision
+        function generateStreets(rng) {
+            const streets = [];
+            const halfWorld = WORLD_CONFIG.worldSize / 2;
+
+            // Main avenues (cross the entire map)
+            streets.push({
+                type: 'avenue',
+                x: -halfWorld, y: -WORLD_CONFIG.streetWidths.avenue / 2,
+                width: WORLD_CONFIG.worldSize, height: WORLD_CONFIG.streetWidths.avenue,
+                orientation: 'horizontal'
+            });
+            streets.push({
+                type: 'avenue',
+                x: -WORLD_CONFIG.streetWidths.avenue / 2, y: -halfWorld,
+                width: WORLD_CONFIG.streetWidths.avenue, height: WORLD_CONFIG.worldSize,
+                orientation: 'vertical'
+            });
+
+            // Recursive subdivision to create blocks
+            function subdivide(bounds, depth) {
+                const { x, y, w, h } = bounds;
+
+                if (depth > 5) return;
+                if (w < WORLD_CONFIG.minBlockSize * 2.5 || h < WORLD_CONFIG.minBlockSize * 2.5) return;
+
+                const splitVertical = rng() > 0.5 ? (w > h * 1.3) : (w > h * 0.7);
+
+                if (splitVertical && w > WORLD_CONFIG.minBlockSize * 2.5) {
+                    const streetType = depth < 2 ? 'street' : (rng() > 0.7 ? 'narrow' : 'street');
+                    const streetW = WORLD_CONFIG.streetWidths[streetType];
+                    const splitPos = x + WORLD_CONFIG.minBlockSize + rng() * (w - WORLD_CONFIG.minBlockSize * 2 - streetW);
+
+                    streets.push({
+                        type: streetType,
+                        x: splitPos, y: y,
+                        width: streetW, height: h,
+                        orientation: 'vertical'
+                    });
+
+                    subdivide({ x, y, w: splitPos - x, h }, depth + 1);
+                    subdivide({ x: splitPos + streetW, y, w: x + w - splitPos - streetW, h }, depth + 1);
+                } else if (h > WORLD_CONFIG.minBlockSize * 2.5) {
+                    const streetType = depth < 2 ? 'street' : (rng() > 0.7 ? 'narrow' : 'street');
+                    const streetH = WORLD_CONFIG.streetWidths[streetType];
+                    const splitPos = y + WORLD_CONFIG.minBlockSize + rng() * (h - WORLD_CONFIG.minBlockSize * 2 - streetH);
+
+                    streets.push({
+                        type: streetType,
+                        x: x, y: splitPos,
+                        width: w, height: streetH,
+                        orientation: 'horizontal'
+                    });
+
+                    subdivide({ x, y, w, h: splitPos - y }, depth + 1);
+                    subdivide({ x, y: splitPos + streetH, w, h: y + h - splitPos - streetH }, depth + 1);
+                }
+            }
+
+            // Subdivide each quadrant
+            const quadrantSize = halfWorld - WORLD_CONFIG.streetWidths.avenue / 2;
+            subdivide({ x: -halfWorld, y: -halfWorld, w: quadrantSize, h: quadrantSize }, 0);
+            subdivide({ x: WORLD_CONFIG.streetWidths.avenue / 2, y: -halfWorld, w: quadrantSize, h: quadrantSize }, 0);
+            subdivide({ x: -halfWorld, y: WORLD_CONFIG.streetWidths.avenue / 2, w: quadrantSize, h: quadrantSize }, 0);
+            subdivide({ x: WORLD_CONFIG.streetWidths.avenue / 2, y: WORLD_CONFIG.streetWidths.avenue / 2, w: quadrantSize, h: quadrantSize }, 0);
+
+            // Add occasional alleys
+            for (let i = 0; i < 30; i++) {
+                const baseStreet = streets[Math.floor(rng() * streets.length)];
+                if (baseStreet.type === 'alley') continue;
+
+                const alleyW = WORLD_CONFIG.streetWidths.alley;
+                if (baseStreet.orientation === 'horizontal') {
+                    const ax = baseStreet.x + rng() * (baseStreet.width - 50);
+                    const ay = baseStreet.y + baseStreet.height;
+                    const ah = 40 + rng() * 80;
+                    streets.push({ type: 'alley', x: ax, y: ay, width: alleyW, height: ah, orientation: 'vertical' });
+                } else {
+                    const ax = baseStreet.x + baseStreet.width;
+                    const ay = baseStreet.y + rng() * (baseStreet.height - 50);
+                    const aw = 40 + rng() * 80;
+                    streets.push({ type: 'alley', x: ax, y: ay, width: aw, height: alleyW, orientation: 'horizontal' });
+                }
+            }
+
+            return streets;
+        }
+
+        // Identify blocks from street network
+        function identifyBlocks(streets, rng) {
+            const blocks = [];
+            const halfWorld = WORLD_CONFIG.worldSize / 2;
+            const gridStep = 50;
+
+            function isOnStreet(px, py) {
+                for (const s of streets) {
+                    if (px >= s.x && px <= s.x + s.width && py >= s.y && py <= s.y + s.height) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+
+            const visited = new Set();
+
+            for (let scanY = -halfWorld + 20; scanY < halfWorld; scanY += gridStep) {
+                for (let scanX = -halfWorld + 20; scanX < halfWorld; scanX += gridStep) {
+                    if (isOnStreet(scanX, scanY)) continue;
+
+                    const key = `${Math.floor(scanX / gridStep)},${Math.floor(scanY / gridStep)}`;
+                    if (visited.has(key)) continue;
+                    visited.add(key);
+
+                    // Find block bounds
+                    let minX = scanX, maxX = scanX, minY = scanY, maxY = scanY;
+
+                    while (minX > -halfWorld && !isOnStreet(minX - 5, scanY)) minX -= 5;
+                    while (maxX < halfWorld && !isOnStreet(maxX + 5, scanY)) maxX += 5;
+                    while (minY > -halfWorld && !isOnStreet(scanX, minY - 5)) minY -= 5;
+                    while (maxY < halfWorld && !isOnStreet(scanX, maxY + 5)) maxY += 5;
+
+                    const w = maxX - minX;
+                    const h = maxY - minY;
+
+                    if (w < WORLD_CONFIG.minBlockSize * 0.5 || h < WORLD_CONFIG.minBlockSize * 0.5) continue;
+                    if (w > WORLD_CONFIG.maxBlockSize * 2 || h > WORLD_CONFIG.maxBlockSize * 2) continue;
+
+                    // Check for duplicate blocks
+                    const isDuplicate = blocks.some(b =>
+                        Math.abs(b.x - minX) < 30 && Math.abs(b.y - minY) < 30
+                    );
+                    if (isDuplicate) continue;
+
+                    // District type based on distance from center
+                    const dist = Math.sqrt((minX + w / 2) ** 2 + (minY + h / 2) ** 2);
+                    let districtType;
+                    if (dist < 400) districtType = 'downtown';
+                    else if (dist < 1000) districtType = 'commercial';
+                    else if (dist < 1800) districtType = 'residential';
+                    else districtType = 'industrial';
+
+                    blocks.push({
+                        x: minX, y: minY, w, h,
+                        districtType,
+                        density: rng()
+                    });
+                }
+            }
+
+            return blocks;
+        }
+
+        // Subdivide blocks into parcels
+        function subdivideParcels(blocks, rng) {
+            const parcels = [];
+
+            for (const block of blocks) {
+                const padding = WORLD_CONFIG.buildingPadding;
+                const innerX = block.x + padding;
+                const innerY = block.y + padding;
+                const innerW = block.w - padding * 2;
+                const innerH = block.h - padding * 2;
+
+                if (innerW < 40 || innerH < 40) {
+                    parcels.push({ ...block, x: innerX, y: innerY, w: innerW, h: innerH, parentBlock: block });
+                    continue;
+                }
+
+                // Decide parcel layout based on block shape and district
+                const aspect = innerW / innerH;
+                const subdivisions = block.districtType === 'downtown' ? 1 :
+                    (block.districtType === 'commercial' ? (rng() > 0.5 ? 2 : 1) :
+                        (rng() > 0.3 ? 2 : (rng() > 0.5 ? 3 : 1)));
+
+                if (subdivisions === 1 || (innerW < 80 && innerH < 80)) {
+                    parcels.push({ x: innerX, y: innerY, w: innerW, h: innerH, parentBlock: block });
+                } else if (aspect > 1.5) {
+                    // Wide block: vertical splits
+                    const pw = innerW / subdivisions;
+                    for (let i = 0; i < subdivisions; i++) {
+                        parcels.push({
+                            x: innerX + i * pw + (i > 0 ? 4 : 0),
+                            y: innerY,
+                            w: pw - (i > 0 && i < subdivisions - 1 ? 8 : 4),
+                            h: innerH,
+                            parentBlock: block
+                        });
+                    }
+                } else if (aspect < 0.67) {
+                    // Tall block: horizontal splits
+                    const ph = innerH / subdivisions;
+                    for (let i = 0; i < subdivisions; i++) {
+                        parcels.push({
+                            x: innerX,
+                            y: innerY + i * ph + (i > 0 ? 4 : 0),
+                            w: innerW,
+                            h: ph - (i > 0 && i < subdivisions - 1 ? 8 : 4),
+                            parentBlock: block
+                        });
+                    }
+                } else {
+                    // Square-ish: grid
+                    const cols = Math.round(Math.sqrt(subdivisions * aspect));
+                    const rows = Math.max(1, Math.round(subdivisions / cols));
+                    const pw = innerW / cols;
+                    const ph = innerH / rows;
+                    for (let r = 0; r < rows; r++) {
+                        for (let c = 0; c < cols; c++) {
+                            parcels.push({
+                                x: innerX + c * pw + 3,
+                                y: innerY + r * ph + 3,
+                                w: pw - 6,
+                                h: ph - 6,
+                                parentBlock: block
+                            });
+                        }
+                    }
+                }
+            }
+
+            return parcels;
+        }
+
+        // Place buildings on parcels
+        function placeBuildings(parcels, rng) {
+            const buildings = [];
+
+            for (const parcel of parcels) {
+                if (parcel.w < 30 || parcel.h < 30) continue;
+                if (rng() < 0.15) continue; // Some empty lots
+
+                const district = parcel.parentBlock.districtType;
+                const padding = 5;
+
+                // Building size based on parcel and district
+                let bw, bh, height;
+
+                if (district === 'downtown') {
+                    bw = parcel.w - padding * 2;
+                    bh = parcel.h - padding * 2;
+                    height = 100 + rng() * 180;
+                } else if (district === 'commercial') {
+                    bw = (parcel.w - padding * 2) * (0.7 + rng() * 0.25);
+                    bh = (parcel.h - padding * 2) * (0.7 + rng() * 0.25);
+                    height = 50 + rng() * 100;
+                } else if (district === 'residential') {
+                    bw = Math.min(parcel.w - padding * 2, 40 + rng() * 40);
+                    bh = Math.min(parcel.h - padding * 2, 35 + rng() * 35);
+                    height = 25 + rng() * 40;
+                } else {
+                    bw = (parcel.w - padding * 2) * (0.5 + rng() * 0.4);
+                    bh = (parcel.h - padding * 2) * (0.5 + rng() * 0.4);
+                    height = 15 + rng() * 25;
+                }
+
+                // Align to street (place at edge of parcel)
+                const alignX = rng() > 0.5 ? parcel.x + padding : parcel.x + parcel.w - bw - padding;
+                const alignY = rng() > 0.5 ? parcel.y + padding : parcel.y + parcel.h - bh - padding;
+
+                // Color based on district
+                const colorSets = {
+                    downtown: [['#1e293b', '#334155'], ['#0f172a', '#1e293b']],
+                    commercial: [['#475569', '#64748b'], ['#525252', '#737373']],
+                    residential: [['#78716c', '#a8a29e'], ['#57534e', '#78716c']],
+                    industrial: [['#4b5563', '#6b7280'], ['#374151', '#4b5563']]
+                };
+                const colorSet = colorSets[district][Math.floor(rng() * 2)];
+
+                buildings.push({
+                    type: 'building',
+                    x: alignX,
+                    y: alignY,
+                    w: bw,
+                    h: bh,
+                    height,
+                    color: colorSet[0],
+                    roofColor: colorSet[1],
+                    baseY: alignY
+                });
+            }
+
+            return buildings;
+        }
+
+        // Place walls as spatial delimiters
+        function placeWalls(parcels, buildings, rng) {
+            const walls = [];
+
+            for (const parcel of parcels) {
+                if (rng() > 0.35) continue; // 35% chance of walls
+
+                const wallHeight = 12 + rng() * 15;
+                const wallColor = rng() > 0.5 ? '#78716c' : '#a8a29e';
+                const wallDepth = 6;
+
+                // Check which edges to wall
+                const edges = [];
+                if (rng() > 0.4) edges.push('top');
+                if (rng() > 0.4) edges.push('left');
+                if (rng() > 0.6) edges.push('bottom');
+                if (rng() > 0.6) edges.push('right');
+
+                for (const edge of edges) {
+                    let wx, wy, ww, wd;
+
+                    if (edge === 'top') {
+                        wx = parcel.x; wy = parcel.y - wallDepth;
+                        ww = parcel.w; wd = wallDepth;
+                    } else if (edge === 'left') {
+                        wx = parcel.x - wallDepth; wy = parcel.y;
+                        ww = wallDepth; wd = parcel.h;
+                    } else if (edge === 'bottom') {
+                        wx = parcel.x; wy = parcel.y + parcel.h;
+                        ww = parcel.w; wd = wallDepth;
+                    } else {
+                        wx = parcel.x + parcel.w; wy = parcel.y;
+                        ww = wallDepth; wd = parcel.h;
+                    }
+
+                    // Check overlap with buildings
+                    const overlaps = buildings.some(b =>
+                        wx < b.x + b.w + 5 && wx + ww + 5 > b.x &&
+                        wy < b.y + b.h + 5 && wy + wd + 5 > b.y
+                    );
+
+                    if (!overlaps) {
+                        walls.push({
+                            type: 'wall',
+                            x: wx, y: wy,
+                            width: ww, depth: wd,
+                            height: wallHeight,
+                            color: wallColor
+                        });
+                    }
+                }
+            }
+
+            return walls;
+        }
+
+        // Place trees intelligently
+        function placeTrees(streets, buildings, walls, rng) {
+            const trees = [];
+            const clearRadius = WORLD_CONFIG.treeClearRadius;
+
+            // Trees along streets
+            for (const street of streets) {
+                if (street.type === 'alley') continue;
+
+                const spacing = street.type === 'avenue' ? 80 : 60;
+                const offset = street.type === 'avenue' ? 15 : 10;
+
+                if (street.orientation === 'horizontal') {
+                    for (let x = street.x + 30; x < street.x + street.width - 30; x += spacing) {
+                        if (rng() > 0.6) continue;
+
+                        const ty1 = street.y - offset;
+                        const ty2 = street.y + street.height + offset;
+
+                        for (const ty of [ty1, ty2]) {
+                            if (rng() > 0.5) continue;
+
+                            const treeData = createTreeData(x, ty, rng);
+                            if (!hasNearbyObstacle(x, ty, clearRadius, buildings, walls, trees)) {
+                                trees.push(treeData);
+                            }
+                        }
+                    }
+                } else {
+                    for (let y = street.y + 30; y < street.y + street.height - 30; y += spacing) {
+                        if (rng() > 0.6) continue;
+
+                        const tx1 = street.x - offset;
+                        const tx2 = street.x + street.width + offset;
+
+                        for (const tx of [tx1, tx2]) {
+                            if (rng() > 0.5) continue;
+
+                            const treeData = createTreeData(tx, y, rng);
+                            if (!hasNearbyObstacle(tx, y, clearRadius, buildings, walls, trees)) {
+                                trees.push(treeData);
+                            }
+                        }
+                    }
+                }
+            }
+
+            return trees;
+        }
+
+        function createTreeData(x, y, rng) {
+            return {
+                type: 'tree',
+                x, y,
+                height: 35 + rng() * 30,
+                crownSize: 16 + rng() * 14,
+                trunkWidth: 5 + rng() * 4,
+                color: rng() > 0.5 ? '#166534' : '#15803d',
+                trunkColor: '#78350f'
+            };
+        }
+
+        function hasNearbyObstacle(x, y, radius, buildings, walls, trees) {
+            for (const b of buildings) {
+                if (x > b.x - radius && x < b.x + b.w + radius &&
+                    y > b.y - radius && y < b.y + b.h + radius) return true;
+            }
+            for (const w of walls) {
+                if (x > w.x - radius && x < w.x + w.width + radius &&
+                    y > w.y - radius && y < w.y + w.depth + radius) return true;
+            }
+            for (const t of trees) {
+                const dist = Math.sqrt((x - t.x) ** 2 + (y - t.y) ** 2);
+                if (dist < radius) return true;
+            }
+            return false;
+        }
+
+        // Place bushes in residual spaces
+        function placeBushes(streets, buildings, walls, trees, rng) {
+            const bushes = [];
+            const minDist = WORLD_CONFIG.bushMinDistance;
+
+            // Bushes near walls and building corners
+            for (const wall of walls) {
+                if (rng() > 0.4) continue;
+
+                const numBushes = 1 + Math.floor(rng() * 2);
+                for (let i = 0; i < numBushes; i++) {
+                    const bx = wall.x + rng() * wall.width;
+                    const by = wall.y + rng() * wall.depth + (rng() > 0.5 ? wall.depth + 5 : -15);
+
+                    if (!hasNearbyObstacle(bx, by, minDist, buildings, walls, trees)) {
+                        bushes.push({
+                            type: 'bush',
+                            x: bx, y: by,
+                            width: 12 + rng() * 10,
+                            depth: 10 + rng() * 8,
+                            height: 6 + rng() * 8,
+                            color: rng() > 0.5 ? '#166534' : '#14532d'
+                        });
+                    }
+                }
+            }
+
+            // Additional bushes at street corners
+            for (let i = 0; i < 50; i++) {
+                const street = streets[Math.floor(rng() * streets.length)];
+                if (street.type === 'alley') continue;
+
+                const bx = street.x + (rng() > 0.5 ? -10 : street.width + 5);
+                const by = street.y + (rng() > 0.5 ? -10 : street.height + 5);
+
+                if (!hasNearbyObstacle(bx, by, minDist, buildings, walls, trees)) {
+                    bushes.push({
+                        type: 'bush',
+                        x: bx, y: by,
+                        width: 10 + rng() * 12,
+                        depth: 8 + rng() * 10,
+                        height: 5 + rng() * 7,
+                        color: rng() > 0.5 ? '#166534' : '#14532d'
+                    });
+                }
+            }
+
+            return bushes;
+        }
+
+        // Main world generation function
+        function generateWorld() {
+            if (worldData.generated) return;
+
+            console.log('Generating world with seed:', WORLD_SEED);
+            const rng = createPRNG(WORLD_SEED);
+
+            worldData.streets = generateStreets(rng);
+            worldData.blocks = identifyBlocks(worldData.streets, rng);
+            worldData.parcels = subdivideParcels(worldData.blocks, rng);
+            worldData.buildings = placeBuildings(worldData.parcels, rng);
+            worldData.walls = placeWalls(worldData.parcels, worldData.buildings, rng);
+            worldData.trees = placeTrees(worldData.streets, worldData.buildings, worldData.walls, rng);
+            worldData.bushes = placeBushes(worldData.streets, worldData.buildings, worldData.walls, worldData.trees, rng);
+
+            // Build spatial index
+            for (const b of worldData.buildings) addToSpatialIndex(b);
+            for (const w of worldData.walls) addToSpatialIndex(w);
+            for (const t of worldData.trees) addToSpatialIndex(t);
+            for (const bush of worldData.bushes) addToSpatialIndex(bush);
+
+            worldData.generated = true;
+            console.log(`World generated: ${worldData.buildings.length} buildings, ${worldData.walls.length} walls, ${worldData.trees.length} trees, ${worldData.bushes.length} bushes`);
+        }
+
+        function hexToRgb(hex) {
+            const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+            return result ? { r: parseInt(result[1], 16), g: parseInt(result[2], 16), b: parseInt(result[3], 16) } : null;
+        }
+
         // --- Game State ---
         let width, height;
-        
-        const camera = { x: 0, y: 0 };
-        
+
+        const camera = {
+            x: 0,
+            y: 0,
+            vx: 0,
+            vy: 0
+        };
+
         const car = {
-            x: 0, 
+            x: 0,
             y: 0,
             width: 24,
             length: 44,
@@ -75,12 +687,13 @@
 
         const particles = [];
         const skidMarks = []; // Persistent skid marks on the ground
-        
+
         // Speed lines/dust particles for motion reference
-        const dustParticles = Array.from({ length: 50 }, () => ({
+        const dustParticles = Array.from({ length: 60 }, () => ({
             x: Math.random() * window.innerWidth,
             y: Math.random() * window.innerHeight,
-            size: Math.random() * 2 + 1
+            size: Math.random() * 2 + 1,
+            z: Math.random() * 0.5 + 0.1 // Depth/Parallax factor (0.1 = background, 0.6 = foreground)
         }));
 
         // --- Resize Handling ---
@@ -115,12 +728,40 @@
         function clamp(val, min, max) { return Math.max(min, Math.min(max, val)); }
 
         // --- Physics Engine ---
+        function checkCollision(x, y) {
+            // Usar índice espacial para buscar entidades próximas
+            const entities = getEntitiesInArea(x, y, 100);
+
+            for (const item of entities) {
+                if (item.type === 'building') {
+                    // Colisão retangular com prédio
+                    if (x > item.x && x < item.x + item.w &&
+                        y > item.y && y < item.y + item.h) {
+                        return true;
+                    }
+                } else if (item.type === 'tree') {
+                    // Colisão circular com tronco
+                    const dist = Math.sqrt((x - item.x) ** 2 + (y - item.y) ** 2);
+                    if (dist < item.trunkWidth * 0.8) return true;
+                } else if (item.type === 'wall') {
+                    // Colisão retangular com muro
+                    if (x > item.x && x < item.x + item.width &&
+                        y > item.y && y < item.y + item.depth) {
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
         function updatePhysics() {
-            // Steering input
+            // ... (restante sem alteração até os corners)
+            // 1. Input & Basic Handling
             const targetSteer = (inputs.right ? 1 : 0) - (inputs.left ? 1 : 0);
-            
+
             // Steer logic: responsive but smooth
-            // Higher speed = slower steering response (stability)
+            // Higher speed = slower steering response (stability) unless drifting
             const steerSpeed = 0.2 - (Math.min(car.speed, 20) * 0.005);
             car.steerAngle = lerp(car.steerAngle, targetSteer * car.maxSteer, Math.max(0.05, steerSpeed));
 
@@ -128,93 +769,179 @@
             let throttle = 0;
             if (inputs.up) throttle = 1;
             if (inputs.down) throttle = -0.5;
-            
+
             // Handbrake overrides throttle
             if (inputs.brake) throttle = 0;
 
-            // Apply force in facing direction
+            // 2. Motion Vectors
             const forwardX = Math.cos(car.angle);
             const forwardY = Math.sin(car.angle);
+            const rightX = -Math.sin(car.angle);
+            const rightY = Math.cos(car.angle);
 
-            // Engine power
-            car.velocity.x += forwardX * throttle * car.acceleration;
-            car.velocity.y += forwardY * throttle * car.acceleration;
+            // 3. Current Velocity Analysis (Local Space)
+            // Project world velocity onto car axes
+            const currentFwdSpeed = car.velocity.x * forwardX + car.velocity.y * forwardY;
+            const currentLatSpeed = car.velocity.x * rightX + car.velocity.y * rightY;
 
-            // Global Friction
+            // 4. Drift Logic
+            // Arcade Drift Condition: Handbrake or high existing lateral slip
+            // We want "Lateral Slip" to be the defining drift characteristic
+            const absLatSpeed = Math.abs(currentLatSpeed);
+            const isDrifting = inputs.brake || absLatSpeed > 1.5;
+
+            // 5. Turning Physics (Yaw)
+            if (car.speed > 0.1) {
+                // Moving forward or backward?
+                const dir = currentFwdSpeed > 0 ? 1 : -1;
+
+                let turnMultiplier = 0.012; // Base turn rate
+                if (isDrifting) {
+                    turnMultiplier = 0.025; // Turn faster when drifting (oversteer ability)
+                }
+
+                // Apply rotation
+                // We use car.speed to ensure we can't turn when stopped
+                // But we clamp the effective speed for turning so high speed doesn't make it uncontrollable
+                // However, arcade racers often allow CONSTANT turn rate regardless of speed if speed > threshold
+                const effectiveTurnSpeed = Math.min(car.speed, 10);
+                car.angle += car.steerAngle * effectiveTurnSpeed * turnMultiplier * dir;
+            }
+
+            // 6. Velocity Updates
+            // Apply Engine Force (only forward)
+            // If drifting, reduce useful forward traction slightly? Maybe not for arcade fun.
+            const traction = inputs.brake ? 0 : 1;
+            car.velocity.x += forwardX * throttle * car.acceleration * traction;
+            car.velocity.y += forwardY * throttle * car.acceleration * traction;
+
+            // 7. Friction & Slip
+            // Forward Friction (Air resistance + Rolling resistance)
             car.velocity.x *= car.friction;
             car.velocity.y *= car.friction;
-            
-            // Handbrake friction (stronger deceleration)
+
+            // Lateral Friction (The Key to Drift)
+            // High friction = Grip (Follows car angle)
+            // Low friction = Drift (Slides sideways)
+            let lateralFriction = 0.8; // Grip (kill slide fast)
+
             if (inputs.brake) {
-                car.velocity.x *= 0.96;
-                car.velocity.y *= 0.96;
+                lateralFriction = 0.985; // Super slippery (Handbrake)
+            } else if (absLatSpeed > 2.0) {
+                lateralFriction = 0.97; // Maintain drift momentum
+            } else if (absLatSpeed > 0.5) {
+                lateralFriction = 0.92; // Transition
             }
 
-            // Calculate speed
-            car.speed = Math.sqrt(car.velocity.x**2 + car.velocity.y**2);
+            // Recalculate local velocities with new friction applied ONLY to lateral component
+            // To do this correctly: decompose, apply friction to lateral, recompose.
 
-            // Turning Physics
-            if (car.speed > 0.1) {
-                const dot = car.velocity.x * forwardX + car.velocity.y * forwardY;
-                const dir = dot > 0 ? 1 : -1; // Moving forward or backward
-                
-                // Turn rate depends on speed. 
-                // Low speed: Turn fast (parking). High speed: Turn slower (highway).
-                // But drift requires oversteer.
-                // We multiply steering by speed to get angular change, but clamp it.
-                car.angle += car.steerAngle * Math.min(car.speed, 8) * 0.012 * dir; 
+            // Decompose current (updated) world velocity
+            const vFwd = car.velocity.x * forwardX + car.velocity.y * forwardY;
+            const vLat = car.velocity.x * rightX + car.velocity.y * rightY;
+
+            // Apply different frictions
+            // We already applied global friction, so just handle the lateral slip specific logic
+            const newLat = vLat * lateralFriction;
+            // Maybe apply extra drag to forward component if drifting (scrubbing speed)
+            const newFwd = vFwd; // * (isDrifting ? 0.99 : 1.0); 
+
+            // Recompose
+            car.velocity.x = forwardX * newFwd + rightX * newLat;
+            car.velocity.y = forwardY * newFwd + rightY * newLat;
+
+            // Handbrake specific strong deceleration (scrubbing all speed)
+            if (inputs.brake) {
+                car.velocity.x *= 0.97;
+                car.velocity.y *= 0.97;
             }
 
-            // --- DRIFT & GRIP ---
-            if (car.speed > 0.1) {
-                const vx = car.velocity.x;
-                const vy = car.velocity.y;
+            // Update scalar speed variable (for display/logic use)
+            car.speed = Math.sqrt(car.velocity.x ** 2 + car.velocity.y ** 2);
 
-                const rightX = -Math.sin(car.angle);
-                const rightY = Math.cos(car.angle);
-                
-                // Lateral velocity (how much we are sliding sideways)
-                const lateralVel = vx * rightX + vy * rightY;
-                const lateralSpeed = Math.abs(lateralVel);
+            // 8. Visual Effects Triggers
+            if (absLatSpeed > 1.5 || (inputs.brake && car.speed > 1)) {
+                addWheelEffects(absLatSpeed);
+            }
 
-                // Grip Factor:
-                // Normal driving: high grip (kill lateral velocity)
-                // Drifting (Handbrake or excessive lateral force): low grip
-                
-                let lateralFriction = 0.85; // Base grip
-                
-                // Initiate drift if turning hard at speed or handbraking
-                if (inputs.brake) {
-                    lateralFriction = 0.96; // Ice-like slide
-                } else if (lateralSpeed > 2.0) {
-                    lateralFriction = 0.92; // Momentum carries slide
+            // 9. Position Update
+            const nextX = car.x + car.velocity.x;
+            const nextY = car.y + car.velocity.y;
+
+            // Verificação de colisão nos 4 cantos do carro para precisão
+            const cos = Math.cos(car.angle);
+            const sin = Math.sin(car.angle);
+            const hw = car.width / 2;
+            const hl = car.length / 2;
+
+            const corners = [
+                { nx: nextX + (hl * cos - hw * sin), ny: nextY + (hl * sin + hw * cos) },
+                { nx: nextX + (hl * cos + hw * sin), ny: nextY + (hl * sin - hw * cos) },
+                { nx: nextX + (-hl * cos - hw * sin), ny: nextY + (-hl * sin + hw * cos) },
+                { nx: nextX + (-hl * cos + hw * sin), ny: nextY + (-hl * sin - hw * cos) },
+                { nx: nextX, ny: nextY } // Ponto central para evitar passar por troncos finos
+            ];
+
+            let hasCollided = false;
+            for (const p of corners) {
+                if (checkCollision(p.nx, p.ny)) {
+                    hasCollided = true;
+                    break;
                 }
-
-                // Apply lateral friction (cancel out sideways movement)
-                const newLateralVel = lateralVel * lateralFriction;
-                
-                // Longitudinal velocity
-                const fwdDot = vx * forwardX + vy * forwardY;
-                
-                // Recompose velocity
-                car.velocity.x = forwardX * fwdDot + rightX * newLateralVel;
-                car.velocity.y = forwardY * fwdDot + rightY * newLateralVel;
-
-                // Visual Effects
-                if (lateralSpeed > 1.5 || (inputs.brake && car.speed > 1)) {
-                    addWheelEffects(lateralSpeed);
-                }
             }
 
-            // Update Position
-            car.x += car.velocity.x;
-            car.y += car.velocity.y;
+            if (!hasCollided) {
+                car.x = nextX;
+                car.y = nextY;
+            } else {
+                // Resposta de colisão aprimorada: 
+                // 1. Tenta mover apenas em X ou Y para permitir deslizar nas paredes
+                const canMoveX = !corners.some(p => checkCollision(nextX + (p.nx - nextX), car.y + (p.ny - nextY)));
+                const canMoveY = !corners.some(p => checkCollision(car.x + (p.nx - nextX), nextY + (p.ny - nextY)));
 
-            // Camera follow with slight lookahead based on velocity
-            const lookaheadX = car.velocity.x * 20;
-            const lookaheadY = car.velocity.y * 20;
-            camera.x = lerp(camera.x, (car.x + lookaheadX) - width / 2, 0.08);
-            camera.y = lerp(camera.y, (car.y + lookaheadY) - height / 2, 0.08);
+                if (canMoveX) {
+                    car.x = nextX;
+                    car.velocity.y *= 0.5; // Reduz velocidade lateral
+                } else if (canMoveY) {
+                    car.y = nextY;
+                    car.velocity.x *= 0.5; // Reduz velocidade lateral
+                } else {
+                    // Se estiver totalmente bloqueado, repele levemente e zera
+                    const pushDirX = car.x < nextX ? -1 : 1;
+                    const pushDirY = car.y < nextY ? -1 : 1;
+                    car.x += pushDirX * 1;
+                    car.y += pushDirY * 1;
+                    car.velocity.x *= -0.2; // Pequeno rebote
+                    car.velocity.y *= -0.2;
+                }
+                car.speed = Math.sqrt(car.velocity.x ** 2 + car.velocity.y ** 2);
+            }
+
+            // 10. Camera Dynamics (Mass-Spring-Damper)
+            // Target is explicitly centered on car + Helicopter Hover / Turbulence + Look-ahead
+            const time = Date.now() * 0.001;
+            const hoverX = Math.sin(time * 0.5) * 15 + Math.cos(time * 1.2) * 5;
+            const hoverY = Math.cos(time * 0.45) * 15 + Math.sin(time * 1.3) * 5;
+
+            // Look-ahead: Camera aims ahead of the car based on velocity
+            const lookAheadFactor = 15;
+            const targetX = (car.x + car.velocity.x * lookAheadFactor + hoverX) - width / 2;
+            const targetY = (car.y + car.velocity.y * lookAheadFactor + hoverY) - height / 2;
+
+            // Spring params for "Helicopter" feel (Heavy, slightly loose, overshoot capable)
+            const springK = 0.03;   // Strength of pull towards target
+            const damping = 0.88;   // Resistance (Inertia preservation)
+
+            const ax = (targetX - camera.x) * springK;
+            const ay = (targetY - camera.y) * springK;
+
+            camera.vx += ax;
+            camera.vy += ay;
+            camera.vx *= damping;
+            camera.vy *= damping;
+
+            camera.x += camera.vx;
+            camera.y += camera.vy;
         }
 
         // --- Particle System ---
@@ -240,10 +967,10 @@
         function addWheelEffects(intensity) {
             // Calculate wheel positions in world space
             const corners = [
-                { x: car.wheelBase/2, y: car.trackWidth/2, f: true }, // Front Right
-                { x: car.wheelBase/2, y: -car.trackWidth/2, f: true }, // Front Left
-                { x: -car.wheelBase/2, y: car.trackWidth/2, f: false }, // Rear Right
-                { x: -car.wheelBase/2, y: -car.trackWidth/2, f: false }  // Rear Left
+                { x: car.wheelBase / 2, y: car.trackWidth / 2, f: true }, // Front Right
+                { x: car.wheelBase / 2, y: -car.trackWidth / 2, f: true }, // Front Left
+                { x: -car.wheelBase / 2, y: car.trackWidth / 2, f: false }, // Rear Right
+                { x: -car.wheelBase / 2, y: -car.trackWidth / 2, f: false }  // Rear Left
             ];
 
             const cos = Math.cos(car.angle);
@@ -257,12 +984,12 @@
                 if (Math.random() < Math.min(intensity * 0.2, 0.8)) {
                     createParticle(wx, wy, 'smoke');
                 }
-                
+
                 // Skid marks - continuous if drifting hard
                 if (intensity > 2.0 || inputs.brake) {
                     createSkid(wx, wy);
                 }
-                
+
                 // Sparks? If extremely fast drift
                 if (intensity > 6.0 && Math.random() > 0.9) {
                     createParticle(wx, wy, 'spark');
@@ -284,7 +1011,7 @@
                     particles.splice(i, 1);
                 }
             }
-            
+
             // Fade skids
             for (let i = skidMarks.length - 1; i >= 0; i--) {
                 skidMarks[i].life -= 0.005;
@@ -293,78 +1020,443 @@
         }
 
         // --- Rendering ---
-        
-        function drawGround() {
-            // Draw background color
-            ctx.fillStyle = CONFIG.groundColor;
-            ctx.fillRect(0, 0, width, height);
 
-            // Draw Grid (World Space)
+        function drawCitySystem() {
+            // Garantir que o mundo foi gerado
+            generateWorld();
+
+            const renderList = [];
+
+            // Buscar entidades visíveis na área da câmera
+            const viewRadius = Math.max(width, height) * 0.8;
+            const camCenterX = camera.x + width / 2;
+            const camCenterY = camera.y + height / 2;
+
+            // Adicionar prédios visíveis
+            for (const building of worldData.buildings) {
+                if (building.x + building.w > camera.x - 200 && building.x < camera.x + width + 200 &&
+                    building.y + building.h > camera.y - 200 && building.y < camera.y + height + 200) {
+                    renderList.push({
+                        ...building,
+                        y: building.baseY + building.h
+                    });
+                }
+            }
+
+            // Adicionar muros visíveis
+            for (const wall of worldData.walls) {
+                if (wall.x + wall.width > camera.x - 100 && wall.x < camera.x + width + 100 &&
+                    wall.y + wall.depth > camera.y - 100 && wall.y < camera.y + height + 100) {
+                    renderList.push({
+                        ...wall,
+                        y: wall.y + wall.depth
+                    });
+                }
+            }
+
+            // Adicionar árvores visíveis
+            for (const tree of worldData.trees) {
+                if (tree.x > camera.x - 100 && tree.x < camera.x + width + 100 &&
+                    tree.y > camera.y - 100 && tree.y < camera.y + height + 100) {
+                    renderList.push({
+                        ...tree,
+                        y: tree.y + tree.crownSize / 2
+                    });
+                }
+            }
+
+            // Adicionar arbustos visíveis
+            for (const bush of worldData.bushes) {
+                if (bush.x > camera.x - 50 && bush.x < camera.x + width + 50 &&
+                    bush.y > camera.y - 50 && bush.y < camera.y + height + 50) {
+                    renderList.push({
+                        ...bush,
+                        y: bush.y + bush.depth / 2
+                    });
+                }
+            }
+
+            // Adicionar carro à lista de renderização
+            renderList.push({
+                type: 'car',
+                y: car.y + car.width / 2
+            });
+
+            // Ordenar por Y (Painter's Algorithm)
+            renderList.sort((a, b) => a.y - b.y);
+
+            // Desenhar fundo (chão + ruas)
+            drawEnhancedGround();
+
+            // Desenhar poeira/linhas de velocidade
+            drawDust();
+
+            // Desenhar sombras
+            drawShadow();
+
+            // Sombras de prédios e ambiente
+            ctx.fillStyle = CONFIG.shadowColor;
             ctx.save();
             ctx.translate(-camera.x, -camera.y);
-            
-            ctx.strokeStyle = CONFIG.gridColor;
-            ctx.lineWidth = 2;
-            const gridSize = 100;
-            
-            // Calculate visible range
-            const startX = Math.floor(camera.x / gridSize) * gridSize;
-            const startY = Math.floor(camera.y / gridSize) * gridSize;
-            const endX = startX + width + gridSize;
-            const endY = startY + height + gridSize;
+            renderList.forEach(item => {
+                if (item.type === 'building') {
+                    const sx = item.height * CONFIG.lightDir.x;
+                    const sy = item.height * CONFIG.lightDir.y;
+                    const shadX = item.x + sx;
+                    const shadY = item.baseY + sy;
+                    ctx.fillRect(shadX, shadY, item.w, item.h);
+                } else if (item.type === 'tree') {
+                    const sx = item.height * CONFIG.lightDir.x * 0.6;
+                    const sy = item.height * CONFIG.lightDir.y * 0.6;
+                    const tw = item.trunkWidth / 2;
+                    ctx.beginPath();
+                    ctx.moveTo(item.x - tw, item.y);
+                    ctx.lineTo(item.x + tw, item.y);
+                    ctx.lineTo(item.x + tw + sx, item.y + sy);
+                    ctx.lineTo(item.x - tw + sx, item.y + sy);
+                    ctx.closePath();
+                    ctx.ellipse(item.x + sx, item.y + sy, item.crownSize, item.crownSize * 0.7, 0, 0, Math.PI * 2);
+                    ctx.fill();
+                } else if (item.type === 'wall') {
+                    const sx = item.height * CONFIG.lightDir.x;
+                    const sy = item.height * CONFIG.lightDir.y;
+                    ctx.fillRect(item.x + sx, item.y + sy, item.width, item.depth);
+                } else if (item.type === 'bush') {
+                    const sx = item.height * CONFIG.lightDir.x * 0.5;
+                    const sy = item.height * CONFIG.lightDir.y * 0.5;
+                    ctx.beginPath();
+                    ctx.ellipse(item.x + sx, item.y + sy, item.width / 2, item.depth / 2, 0, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+            });
+            ctx.restore();
 
-            ctx.beginPath();
-            for (let x = startX; x <= endX; x += gridSize) {
-                ctx.moveTo(x, startY);
-                ctx.lineTo(x, endY);
-            }
-            for (let y = startY; y <= endY; y += gridSize) {
-                ctx.moveTo(startX, y);
-                ctx.lineTo(endX, y);
-            }
-            ctx.stroke();
-
-            // Draw Skid Marks
+            // Desenhar marcas de derrapagem
+            ctx.save();
+            ctx.translate(-camera.x, -camera.y);
             for (const s of skidMarks) {
                 ctx.fillStyle = `rgba(10, 10, 10, ${s.life * 0.5})`;
                 ctx.save();
                 ctx.translate(s.x, s.y);
                 ctx.rotate(s.angle);
-                ctx.fillRect(-4, -4, 8, 8); 
+                ctx.fillRect(-4, -4, 8, 8);
                 ctx.restore();
             }
+            ctx.restore();
+
+            // Desenhar partículas
+            drawParticles();
+
+            // Desenhar objetos ordenados
+            renderList.forEach(item => {
+                if (item.type === 'car') {
+                    drawParticles();
+                    drawCar();
+                } else if (item.type === 'building') {
+                    drawBuilding(item);
+                } else if (item.type === 'tree') {
+                    drawTree(item);
+                } else if (item.type === 'wall') {
+                    drawWall(item);
+                } else if (item.type === 'bush') {
+                    drawBush(item);
+                }
+            });
+        }
+
+        function drawEnhancedGround() {
+            // Fundo
+            ctx.fillStyle = CONFIG.groundColor;
+            ctx.fillRect(0, 0, width, height);
+
+            ctx.save();
+            ctx.translate(-camera.x, -camera.y);
+
+            // Desenhar ruas do worldData
+            ctx.fillStyle = '#171717'; // Asfalto escuro
+
+            for (const street of worldData.streets) {
+                // Só desenhar ruas visíveis
+                if (street.x + street.width > camera.x - 50 && street.x < camera.x + width + 50 &&
+                    street.y + street.height > camera.y - 50 && street.y < camera.y + height + 50) {
+                    ctx.fillRect(street.x, street.y, street.width, street.height);
+
+                    // Linha central para avenidas
+                    if (street.type === 'avenue') {
+                        ctx.fillStyle = '#333';
+                        if (street.orientation === 'horizontal') {
+                            ctx.fillRect(street.x, street.y + street.height / 2 - 2, street.width, 4);
+                        } else {
+                            ctx.fillRect(street.x + street.width / 2 - 2, street.y, 4, street.height);
+                        }
+                        ctx.fillStyle = '#171717';
+                    }
+                }
+            }
+
+            ctx.restore();
+        }
+
+        function drawBuilding(b) {
+            ctx.save();
+            ctx.translate(-camera.x, -camera.y);
+
+            // Pseudo-3D Radial Extrusion
+            const cameraCX = camera.x + width / 2;
+            const cameraCY = camera.y + height / 2;
+            const boxCX = b.x + b.w / 2;
+            const boxCY = b.baseY + b.h / 2;
+            const dx = boxCX - cameraCX;
+            const dy = boxCY - cameraCY;
+
+            const fovScale = 0.35 * (1 + car.speed * 0.015); // FOV aumenta com a velocidade
+            const extrusionX = (dx * fovScale) * (b.height / 500);
+            const extrusionY = (dy * fovScale) * (b.height / 500);
+
+            const roofX = b.x + extrusionX;
+            const roofY = b.baseY + extrusionY;
+
+            // Draw Sides (Connecting Base to Roof)
+            // Render each wall quad individually to ensure solidity and avoid winding issues
+            const baseCorners = [
+                { x: b.x, y: b.baseY },
+                { x: b.x + b.w, y: b.baseY },
+                { x: b.x + b.w, y: b.baseY + b.h },
+                { x: b.x, y: b.baseY + b.h }
+            ];
+
+            const roofCorners = [
+                { x: roofX, y: roofY },
+                { x: roofX + b.w, y: roofY },
+                { x: roofX + b.w, y: roofY + b.h },
+                { x: roofX, y: roofY + b.h }
+            ];
+
+            // Determine wall visibility and draw
+            for (let i = 0; i < 4; i++) {
+                const next = (i + 1) % 4;
+
+                // Slightly darker walls to give depth perception
+                ctx.fillStyle = i % 2 === 0 ? b.color : shadeColor(b.color, -10);
+
+                ctx.beginPath();
+                ctx.moveTo(baseCorners[i].x, baseCorners[i].y);
+                ctx.lineTo(baseCorners[next].x, baseCorners[next].y);
+                ctx.lineTo(roofCorners[next].x, roofCorners[next].y);
+                ctx.lineTo(roofCorners[i].x, roofCorners[i].y);
+                ctx.closePath();
+                ctx.fill();
+            }
+
+            // Draw Roof
+            ctx.fillStyle = b.roofColor;
+            ctx.fillRect(roofX, roofY, b.w, b.h);
+
+            // Roof Highlight (Edge)
+            ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+            ctx.lineWidth = 1;
+            ctx.strokeRect(roofX, roofY, b.w, b.h);
+
+            ctx.restore();
+        }
+
+        // Helper for subtle depth
+        function shadeColor(hex, percent) {
+            const rgb = hexToRgb(hex);
+            if (!rgb) return hex;
+            const f = (val) => Math.max(0, Math.min(255, val + percent));
+            return `rgb(${f(rgb.r)},${f(rgb.g)},${f(rgb.b)})`;
+        }
+
+        // --- Draw Tree (Copa esférica + Tronco) ---
+        function drawTree(t) {
+            ctx.save();
+            ctx.translate(-camera.x, -camera.y);
+
+            // Pseudo-3D extrusion based on camera
+            const cameraCX = camera.x + width / 2;
+            const cameraCY = camera.y + height / 2;
+            const dx = t.x - cameraCX;
+            const dy = t.y - cameraCY;
+
+            const fovScale = 0.25 * (1 + car.speed * 0.015); // FOV aumenta com a velocidade
+            const extrusionX = (dx * fovScale) * (t.height / 300);
+            const extrusionY = (dy * fovScale) * (t.height / 300);
+
+            // --- Tronco 3D Extrudado ---
+            const tw = t.trunkWidth / 2;
+            const baseCorners = [
+                { x: t.x - tw, y: t.y - tw },
+                { x: t.x + tw, y: t.y - tw },
+                { x: t.x + tw, y: t.y + tw },
+                { x: t.x - tw, y: t.y + tw }
+            ];
+
+            const topX = t.x + extrusionX;
+            const topY = t.y + extrusionY;
+            const topCorners = [
+                { x: topX - tw, y: topY - tw },
+                { x: topX + tw, y: topY - tw },
+                { x: topX + tw, y: topY + tw },
+                { x: topX - tw, y: topY + tw }
+            ];
+
+            // Desenhar faces do tronco para volume
+            for (let i = 0; i < 4; i++) {
+                const next = (i + 1) % 4;
+                ctx.fillStyle = i % 2 === 0 ? t.trunkColor : shadeColor(t.trunkColor, -15);
+                ctx.beginPath();
+                ctx.moveTo(baseCorners[i].x, baseCorners[i].y);
+                ctx.lineTo(baseCorners[next].x, baseCorners[next].y);
+                ctx.lineTo(topCorners[next].x, topCorners[next].y);
+                ctx.lineTo(topCorners[i].x, topCorners[i].y);
+                ctx.closePath();
+                ctx.fill();
+            }
+
+            // Copa (topo com extrusion)
+            const crownX = topX;
+            const crownY = topY;
+
+            // Copa principal
+            ctx.fillStyle = t.color;
+            ctx.beginPath();
+            ctx.ellipse(crownX, crownY, t.crownSize, t.crownSize * 0.85, 0, 0, Math.PI * 2);
+            ctx.fill();
+
+            // Destaque claro na copa
+            ctx.fillStyle = shadeColor(t.color, 15);
+            ctx.beginPath();
+            ctx.ellipse(crownX - t.crownSize * 0.2, crownY - t.crownSize * 0.2, t.crownSize * 0.5, t.crownSize * 0.4, 0, 0, Math.PI * 2);
+            ctx.fill();
+
+            ctx.restore();
+        }
+
+        // --- Draw Wall (Paralelepípedo baixo) ---
+        function drawWall(w) {
+            ctx.save();
+            ctx.translate(-camera.x, -camera.y);
+
+            // Pseudo-3D extrusion
+            const cameraCX = camera.x + width / 2;
+            const cameraCY = camera.y + height / 2;
+            const boxCX = w.x + w.width / 2;
+            const boxCY = w.y + w.depth / 2;
+            const dx = boxCX - cameraCX;
+            const dy = boxCY - cameraCY;
+
+            const fovScale = 0.3;
+            const extrusionX = (dx * fovScale) * (w.height / 200);
+            const extrusionY = (dy * fovScale) * (w.height / 200);
+
+            const topX = w.x + extrusionX;
+            const topY = w.y + extrusionY;
+
+            // Paredes laterais
+            const baseCorners = [
+                { x: w.x, y: w.y },
+                { x: w.x + w.width, y: w.y },
+                { x: w.x + w.width, y: w.y + w.depth },
+                { x: w.x, y: w.y + w.depth }
+            ];
+
+            const topCorners = [
+                { x: topX, y: topY },
+                { x: topX + w.width, y: topY },
+                { x: topX + w.width, y: topY + w.depth },
+                { x: topX, y: topY + w.depth }
+            ];
+
+            for (let i = 0; i < 4; i++) {
+                const next = (i + 1) % 4;
+                ctx.fillStyle = i % 2 === 0 ? w.color : shadeColor(w.color, -10);
+                ctx.beginPath();
+                ctx.moveTo(baseCorners[i].x, baseCorners[i].y);
+                ctx.lineTo(baseCorners[next].x, baseCorners[next].y);
+                ctx.lineTo(topCorners[next].x, topCorners[next].y);
+                ctx.lineTo(topCorners[i].x, topCorners[i].y);
+                ctx.closePath();
+                ctx.fill();
+            }
+
+            // Topo
+            ctx.fillStyle = shadeColor(w.color, 10);
+            ctx.fillRect(topX, topY, w.width, w.depth);
+
+            ctx.restore();
+        }
+
+        // --- Draw Bush (Elipsoide baixo) ---
+        function drawBush(b) {
+            ctx.save();
+            ctx.translate(-camera.x, -camera.y);
+
+            // Pseudo-3D extrusion
+            const cameraCX = camera.x + width / 2;
+            const cameraCY = camera.y + height / 2;
+            const dx = b.x - cameraCX;
+            const dy = b.y - cameraCY;
+
+            const fovScale = 0.2;
+            const extrusionX = (dx * fovScale) * (b.height / 150);
+            const extrusionY = (dy * fovScale) * (b.height / 150);
+
+            const topX = b.x + extrusionX;
+            const topY = b.y + extrusionY;
+
+            // Base
+            ctx.fillStyle = shadeColor(b.color, -15);
+            ctx.beginPath();
+            ctx.ellipse(b.x, b.y, b.width / 2, b.depth / 2, 0, 0, Math.PI * 2);
+            ctx.fill();
+
+            // Topo com extrusion
+            ctx.fillStyle = b.color;
+            ctx.beginPath();
+            ctx.ellipse(topX, topY, b.width / 2 * 0.9, b.depth / 2 * 0.9, 0, 0, Math.PI * 2);
+            ctx.fill();
+
+            // Destaque
+            ctx.fillStyle = shadeColor(b.color, 12);
+            ctx.beginPath();
+            ctx.ellipse(topX - b.width * 0.1, topY - b.depth * 0.1, b.width / 4, b.depth / 4, 0, 0, Math.PI * 2);
+            ctx.fill();
 
             ctx.restore();
         }
 
         function drawDust() {
             ctx.fillStyle = '#666';
-            
+
             // We simulate dust by updating their screen position relative to camera movement
             // Ideally this should be in update loop, but doing it here for simplicity
             // To make them "World" fixed, we can just use (worldPos % viewport)
-            
+
             // Actually, let's treat them as world objects wrapped in a large window around the camera
             // to avoid floating point issues? No, simplest is Screen Space Parallax.
-            
+
             // Update dust positions based on car velocity (approximation of camera move)
             const dx = car.velocity.x;
             const dy = car.velocity.y;
 
             dustParticles.forEach(p => {
-                p.x -= dx;
-                p.y -= dy;
+                // Parallax move: foreground moves faster
+                p.x -= dx * p.z;
+                p.y -= dy * p.z;
 
                 // Wrap around screen
-                if (p.x < 0) p.x += width;
-                if (p.x > width) p.x -= width;
-                if (p.y < 0) p.y += height;
-                if (p.y > height) p.y -= height;
+                if (p.x < -50) p.x += width + 100;
+                if (p.x > width + 50) p.x -= width + 100;
+                if (p.y < -50) p.y += height + 100;
+                if (p.y > height + 50) p.y -= height + 100;
 
-                // Draw
+                // Draw with opacity based on depth
+                ctx.globalAlpha = p.z * 1.5;
                 ctx.fillRect(p.x, p.y, p.size, p.size);
             });
-            
+            ctx.globalAlpha = 1.0;
+
             // Speed Lines (at high speed)
             if (car.speed > 10) {
                 ctx.strokeStyle = 'rgba(255, 255, 255, 0.1)';
@@ -386,7 +1478,7 @@
         function drawShadow() {
             ctx.save();
             ctx.translate(-camera.x, -camera.y);
-            
+
             const bodyHeight = 16;
             const wheelHeight = 4; // Wheels are lower to ground
 
@@ -397,10 +1489,10 @@
 
             // Draw shadow relative to car position
             ctx.translate(car.x, car.y);
-            
+
             // We need to draw the rotated shapes at the offset positions
             ctx.fillStyle = CONFIG.shadowColor;
-            
+
             // 1. Wheel Shadows (Low offset)
             const drawWheelShadow = (x, y, angle) => {
                 ctx.save();
@@ -410,23 +1502,23 @@
                 const sin = Math.sin(car.angle);
                 const rx = x * cos - y * sin;
                 const ry = x * sin + y * cos;
-                
+
                 ctx.translate(rx + wx, ry + wy); // Move to wheel world pos + shadow offset
                 ctx.rotate(car.angle + angle);   // Rotate by car + steer
-                ctx.fillRect(-car.wheelLength/2, -car.wheelWidth/2, car.wheelLength, car.wheelWidth);
+                ctx.fillRect(-car.wheelLength / 2, -car.wheelWidth / 2, car.wheelLength, car.wheelWidth);
                 ctx.restore();
             };
 
-            drawWheelShadow(-car.wheelBase/2, car.trackWidth/2, 0);
-            drawWheelShadow(-car.wheelBase/2, -car.trackWidth/2, 0);
-            drawWheelShadow(car.wheelBase/2, car.trackWidth/2, car.steerAngle);
-            drawWheelShadow(car.wheelBase/2, -car.trackWidth/2, car.steerAngle);
+            drawWheelShadow(-car.wheelBase / 2, car.trackWidth / 2, 0);
+            drawWheelShadow(-car.wheelBase / 2, -car.trackWidth / 2, 0);
+            drawWheelShadow(car.wheelBase / 2, car.trackWidth / 2, car.steerAngle);
+            drawWheelShadow(car.wheelBase / 2, -car.trackWidth / 2, car.steerAngle);
 
             // 2. Body Shadow (Higher offset)
             ctx.save();
             ctx.translate(bx, by); // Body shadow offset
             ctx.rotate(car.angle);
-            ctx.fillRect(-car.length/2, -car.width/2, car.length, car.width);
+            ctx.fillRect(-car.length / 2, -car.width / 2, car.length, car.width);
             ctx.restore();
 
             ctx.restore();
@@ -445,7 +1537,7 @@
                 ctx.translate(x, y);
                 ctx.rotate(angle);
                 ctx.beginPath();
-                ctx.roundRect(-car.wheelLength/2, -car.wheelWidth/2, car.wheelLength, car.wheelWidth, 2);
+                ctx.roundRect(-car.wheelLength / 2, -car.wheelWidth / 2, car.wheelLength, car.wheelWidth, 2);
                 ctx.fill();
                 // Rim detail
                 if (car.speed < 5) {
@@ -456,26 +1548,26 @@
                 ctx.restore();
             };
 
-            drawWheel(-car.wheelBase/2, car.trackWidth/2, 0);
-            drawWheel(-car.wheelBase/2, -car.trackWidth/2, 0);
-            drawWheel(car.wheelBase/2, car.trackWidth/2, car.steerAngle);
-            drawWheel(car.wheelBase/2, -car.trackWidth/2, car.steerAngle);
+            drawWheel(-car.wheelBase / 2, car.trackWidth / 2, 0);
+            drawWheel(-car.wheelBase / 2, -car.trackWidth / 2, 0);
+            drawWheel(car.wheelBase / 2, car.trackWidth / 2, car.steerAngle);
+            drawWheel(car.wheelBase / 2, -car.trackWidth / 2, car.steerAngle);
 
             // --- Body ---
             // Main Chassis
             ctx.fillStyle = CONFIG.carColor;
             ctx.beginPath();
-            ctx.roundRect(-car.length/2, -car.width/2, car.length, car.width, 3);
+            ctx.roundRect(-car.length / 2, -car.width / 2, car.length, car.width, 3);
             ctx.fill();
 
             // Roof/Cabin (Darker)
-            ctx.fillStyle = '#991b1b'; 
-            ctx.fillRect(-10, -car.width/2 + 2, 20, car.width - 4);
-            
+            ctx.fillStyle = '#991b1b';
+            ctx.fillRect(-10, -car.width / 2 + 2, 20, car.width - 4);
+
             // Windshields
             ctx.fillStyle = '#111';
-            ctx.fillRect(8, -car.width/2 + 3, 2, car.width - 6); // Front
-            ctx.fillRect(-9, -car.width/2 + 3, 2, car.width - 6); // Rear
+            ctx.fillRect(8, -car.width / 2 + 3, 2, car.width - 6); // Front
+            ctx.fillRect(-9, -car.width / 2 + 3, 2, car.width - 6); // Rear
 
             // Brake Lights (Active when braking)
             if (inputs.brake) {
@@ -486,14 +1578,14 @@
                 ctx.fillStyle = '#500000';
                 ctx.shadowBlur = 0;
             }
-            ctx.fillRect(-car.length/2, -car.width/2 + 1, 2, 6);
-            ctx.fillRect(-car.length/2, car.width/2 - 7, 2, 6);
+            ctx.fillRect(-car.length / 2, -car.width / 2 + 1, 2, 6);
+            ctx.fillRect(-car.length / 2, car.width / 2 - 7, 2, 6);
             ctx.shadowBlur = 0; // Reset
 
             // Headlights (Simple yellow squares)
             ctx.fillStyle = '#facc15';
-            ctx.fillRect(car.length/2 - 1, -car.width/2 + 1, 1, 5);
-            ctx.fillRect(car.length/2 - 1, car.width/2 - 6, 1, 5);
+            ctx.fillRect(car.length / 2 - 1, -car.width / 2 + 1, 1, 5);
+            ctx.fillRect(car.length / 2 - 1, car.width / 2 - 6, 1, 5);
 
             ctx.restore();
         }
@@ -505,7 +1597,7 @@
             for (const p of particles) {
                 ctx.beginPath();
                 ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
-                ctx.fillStyle = p.type === 'smoke' 
+                ctx.fillStyle = p.type === 'smoke'
                     ? `rgba(200, 200, 200, ${p.life * 0.4})`
                     : `rgba(255, 200, 50, ${p.life})`;
                 ctx.fill();
@@ -518,15 +1610,21 @@
             updatePhysics();
             updateParticles();
 
-            // Clear
-            ctx.clearRect(0, 0, width, height);
+            // Clear with dynamic zoom
+            ctx.fillStyle = '#111';
+            ctx.fillRect(0, 0, width, height);
+
+            ctx.save();
+            // Zoom dinâmico baseado na velocidade
+            const zoom = 1 / (1 + car.speed * 0.004);
+            ctx.translate(width / 2, height / 2);
+            ctx.scale(zoom, zoom);
+            ctx.translate(-width / 2, -height / 2);
 
             // Draw Order
-            drawGround();
-            drawDust();
-            drawShadow();
-            drawParticles();
-            drawCar();
+            // Render World (Ground, City, Car sorted)
+            drawCitySystem(); // Handles Ground, Dust, Particles, Shadows, Buildings, Car
+            ctx.restore();
 
             requestAnimationFrame(loop);
         }
@@ -536,4 +1634,5 @@
 
     </script>
 </body>
+
 </html>
